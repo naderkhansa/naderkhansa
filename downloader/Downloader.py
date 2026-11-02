@@ -3853,7 +3853,8 @@ class DownloaderApp:
             self._sm_impersonate_ok = False
             self.log_message("Shortmax: impersonation failed, retrying without it.")
             return True
-        if self.SHORTMAX_COOKIE_ERR.search(err):
+        # A Cloudflare 403 means this browser's cookies don't carry a passed check: try the next browser
+        if self.SHORTMAX_COOKIE_ERR.search(err) or "cloudflare" in err.lower():
             chain = self.shortmax_cookie_chain()
             idx = getattr(self, "_sm_cookie_idx", 0)
             if idx < len(chain) - 1:
@@ -4339,6 +4340,8 @@ class DownloaderApp:
         self.disable_buttons_for_run()
 
         accel_mode = "Turbo (16x)" if self.turbo_var.get() else "Standard (4x)"
+        if source == 1:
+            self._sm_cookie_idx = 0  # you may have just passed the bot check: try your browsers again
         run_header = f"{'='*50}\n--- STARTING NEW DOWNLOAD (Source {source} | {accel_mode}) ---\nURL: {url}"
         self.log_message(run_header)
 
@@ -5435,6 +5438,12 @@ class DownloaderApp:
 
                             if source == 1 and self.shortmax_recover_from_error(err):
                                 continue
+                            if source == 1 and "cloudflare" in err.lower():
+                                self.log_message(
+                                    "Shortmax: blocked by the site's Cloudflare bot check (HTTP 403). "
+                                    "Retrying will not help. Pass the check in your browser, quit the browser, then start again."
+                                )
+                                break
 
                             if source == 2 and any(code in err for code in ("410", "500", "403", "404", "invalid")):
                                 err_snippet = next((line for line in err.splitlines() if "HTTP Error" in line), "Stream Expired/Error")
@@ -5470,7 +5479,10 @@ class DownloaderApp:
                 if not success and not self.stop_flag:
                     if not downloaded_files:
                         self.log_message(f"FAILED ON EPISODE {episode}. Final Error:\n{err}")
-                        self.update_status(f"Ep {episode} Failed. Check Log.", "red")
+                        if source == 1 and "cloudflare" in err.lower():
+                            self.update_status("Shortmax blocked by Cloudflare bot check (403). See log.", "red")
+                        else:
+                            self.update_status(f"Ep {episode} Failed. Check Log.", "red")
                         if not keep_buttons_locked:
                             self.reset_buttons()
                         return
