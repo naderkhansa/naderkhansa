@@ -6,7 +6,52 @@ import subprocess
 import tempfile
 import shutil
 import threading
+import traceback
 import wave
+
+# ==============================================================================
+# STARTUP GUARD — when launched by double-click, show errors instead of closing
+# ==============================================================================
+CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ank_crash_log.txt")
+
+
+def _show_fatal(title: str, msg: str):
+    try:
+        with open(CRASH_LOG, "w", encoding="utf-8") as f:
+            f.write(msg)
+    except OSError:
+        pass
+    try:
+        import tkinter
+        import tkinter.messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        tkinter.messagebox.showerror(title, f"{msg[-1800:]}\n\nDetails saved to:\n{CRASH_LOG}")
+        root.destroy()
+    except Exception:
+        print(f"{title}\n\n{msg}")
+        try:
+            input("\nPress Enter to close...")
+        except Exception:
+            pass
+
+
+_missing = []
+for _mod, _pip in (("cv2", "opencv-python"), ("numpy", "numpy"), ("PIL", "pillow"), ("PyQt6.QtWidgets", "PyQt6")):
+    try:
+        __import__(_mod)
+    except Exception as _e:
+        _missing.append((_pip, f"{_mod}: {_e}"))
+if _missing:
+    _show_fatal(
+        "ANK Media Studio — missing packages",
+        "ANK Media Studio needs these Python packages:\n\n"
+        f"    pip install {' '.join(p for p, _ in _missing)}\n\n"
+        "Open Command Prompt, run the line above, then double-click the app again.\n\n"
+        f"Python used: {sys.executable}\n\nDetails:\n" + "\n".join(d for _, d in _missing)
+    )
+    sys.exit(1)
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -4976,12 +5021,47 @@ class ANKMediaStudio(QMainWindow):
         super().closeEvent(event)
 
 
-if __name__ == "__main__":
+def _install_error_handler():
+    """PyQt6 closes the app on any error inside a button handler; show and log it instead."""
+    def log(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+        if sys.__stderr__:
+            sys.__stderr__.write(text)
+
+    def hook(exc_type, exc, tb):
+        log(exc_type, exc, tb)
+        try:
+            QMessageBox.critical(None, f"{APP_NAME} — error",
+                                 f"Something went wrong (the app keeps running):\n\n{exc}\n\nDetails saved to:\n{CRASH_LOG}")
+        except Exception:
+            pass
+    sys.excepthook = hook
+    # Dialogs may only be shown from the GUI thread, so background errors are logged only
+    threading.excepthook = lambda args: log(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+def main():
     if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setWindowIcon(make_icon("logo", "violet"))
+    _install_error_handler()
     win = ANKMediaStudio()
     win.show()
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        _show_fatal(f"{APP_NAME} could not start", traceback.format_exc())
+        sys.exit(1)
