@@ -1,6 +1,7 @@
 import os, sys, subprocess, re, threading, urllib.parse, webbrowser, datetime, time, shutil, copy
-import json
+import json, math
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
 # Optional Drag-and-Drop support if user has tkinterdnd2 installed
@@ -85,12 +86,194 @@ def clean_folder_Title(raw_name):
     return name[:65] if name else "General_Movie"
 
 
+# =========================================================================
+# 3D GRAPHICS ENGINE (v1.8.0): glossy buttons, tabs, spheres and icons
+# rendered pixel-by-pixel in pure Python (no Pillow needed)
+# =========================================================================
+def _rgb(hex_c):
+    hex_c = hex_c.lstrip("#")
+    return tuple(int(hex_c[i:i + 2], 16) for i in (0, 2, 4))
+
+def _mix(a, b, t):
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
+
+def _hexc(c):
+    return "#%02x%02x%02x" % tuple(0 if v < 0 else (255 if v > 255 else int(v + 0.5)) for v in c)
+
+def _round_rect_dist(px, py, x0, y0, x1, y1, r):
+    """Signed distance from a point to a rounded rectangle (negative inside)."""
+    hx, hy = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+    qx = abs(px - (x0 + hx)) - (hx - r)
+    qy = abs(py - (y0 + hy)) - (hy - r)
+    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+
+def _seg_dist(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+def _rows_to_photo(master, rows):
+    cache = {}
+    def hx(c):
+        v = cache.get(c)
+        if v is None:
+            v = cache[c] = _hexc(c)
+        return v
+    img = tk.PhotoImage(master=master, width=len(rows[0]), height=len(rows))
+    img.put(" ".join("{" + " ".join(hx(c) for c in row) + "}" for row in rows))
+    return img
+
+def render_glossy_rows(w, h, top, bottom, edge, bg, radius=7, gloss=0.24, shadow=2, pressed=False, flat=False):
+    """A beveled glass-like rounded panel with rim light and a soft drop shadow, as pixel rows."""
+    # The shading only varies vertically: render a narrow strip and repeat its middle column
+    core = int(2 * radius + 6)
+    if w > core + 1:
+        narrow = render_glossy_rows(core, h, top, bottom, edge, bg, radius, gloss, shadow, pressed, flat)
+        half = core // 2
+        fill = w - 2 * half
+        return [row[:half] + [row[half]] * fill + row[core - half:] for row in narrow]
+    top_c, bot_c, edge_c, bg_c = _rgb(top), _rgb(bottom), _rgb(edge), _rgb(bg)
+    white, black = (255, 255, 255), (0, 0, 0)
+    body_h = h - shadow
+    rows = []
+    for y in range(h):
+        py = y + 0.5
+        t = py / max(1.0, body_h)
+        base = _mix(bot_c, top_c, t) if pressed else _mix(top_c, bot_c, t)
+        if not pressed and not flat and t < 0.5:
+            base = _mix(base, white, gloss * (1.0 - t / 0.5))
+        row = []
+        for x in range(w):
+            px = x + 0.5
+            col = bg_c
+            if shadow:
+                ds = _round_rect_dist(px, py, 1.0, float(shadow), w - 1.0, float(h), radius)
+                col = _mix(col, black, 0.55 * max(0.0, min(1.0, 0.5 - ds / 1.6)))
+            d = _round_rect_dist(px, py, 0.0, 0.0, float(w), float(body_h), radius)
+            cov = 0.5 - d
+            if cov > 0.0:
+                c = base
+                if d > -1.15:
+                    c = _mix(c, edge_c, 0.8)                          # crisp bevel edge
+                elif d > -2.2 and not pressed and not flat:
+                    c = _mix(c, white, 0.28 if py < body_h * 0.5 else 0.06)  # rim light
+                col = _mix(col, c, cov)
+            row.append(col)
+        rows.append(row)
+    return rows
+
+def render_glossy(master, w, h, top, bottom, edge, bg, **kw):
+    return _rows_to_photo(master, render_glossy_rows(w, h, top, bottom, edge, bg, **kw))
+
+def render_sphere(master, size, color, bg):
+    """A lit 3D ball with diffuse shading and a specular highlight."""
+    c, bg_c = _rgb(color), _rgb(bg)
+    dark = (c[0] * 0.28, c[1] * 0.28, c[2] * 0.28)
+    r = size / 2.0 - 0.6
+    cx = cy = size / 2.0
+    lx, ly, lz = -0.45, -0.6, 0.66
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            dx, dy = (x + 0.5 - cx) / r, (y + 0.5 - cy) / r
+            dd = dx * dx + dy * dy
+            cov = r - math.sqrt(dd) * r + 0.5
+            if cov <= 0:
+                row.append(bg_c)
+                continue
+            nz = math.sqrt(max(0.0, 1.0 - min(1.0, dd)))
+            diff = max(0.0, dx * lx + dy * ly + nz * lz)
+            col = _mix(dark, c, 0.25 + 0.9 * diff)
+            col = _mix(col, (255, 255, 255), 0.85 * diff ** 22)
+            if dy > 0.35:
+                col = _mix(col, c, 0.25 * (dy - 0.35))                # bounce light
+            row.append(_mix(bg_c, col, cov))
+        rows.append(row)
+    return _rows_to_photo(master, rows)
+
+def render_check(master, size, on, color, bg, round_box=False):
+    """3D checkbox (or radio dot when round_box) for ttk indicators."""
+    if on:
+        top, bot, edge = color, _hexc(_mix(_rgb(color), (0, 0, 0), 0.35)), _hexc(_mix(_rgb(color), (255, 255, 255), 0.3))
+    else:
+        top, bot, edge = "#1e293b", "#0f172a", "#475569"
+    rows = render_glossy_rows(size, size, top, bot, edge, bg, radius=(size / 2.0 - 1 if round_box else 4), shadow=1)
+    if on:
+        for y in range(size):
+            for x in range(size):
+                px, py = x + 0.5, y + 0.5
+                if round_box:
+                    d = math.hypot(px - size / 2.0, py - (size - 1) / 2.0) - size * 0.2
+                else:
+                    d = min(_seg_dist(px, py, size * 0.25, size * 0.5, size * 0.43, size * 0.68),
+                            _seg_dist(px, py, size * 0.43, size * 0.68, size * 0.76, size * 0.3)) - 1.1
+                cov = 0.5 - d
+                if cov > 0:
+                    rows[y][x] = _mix(rows[y][x], (255, 255, 255), cov)
+    return _rows_to_photo(master, rows)
+
+def render_app_icon(master, size=64):
+    """Glossy blue-violet rounded tile with a white play symbol and a film notch."""
+    rows = []
+    tri = ((size * 0.38, size * 0.28), (size * 0.38, size * 0.72), (size * 0.74, size * 0.5))
+    def tri_dist(px, py):
+        signs = set()
+        d_min = 1e9
+        for i in range(3):
+            ax, ay = tri[i]
+            bx, by = tri[(i + 1) % 3]
+            cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+            signs.add(cross >= 0)
+            d_min = min(d_min, _seg_dist(px, py, ax, ay, bx, by))
+        return -d_min if len(signs) == 1 else d_min
+    for y in range(size):
+        row = []
+        for x in range(size):
+            px, py = x + 0.5, y + 0.5
+            t = (px + py) / (2.0 * size)
+            col = _mix(_rgb("#3b82f6"), _rgb("#8b5cf6"), t)
+            if py < size * 0.5:
+                col = _mix(col, (255, 255, 255), 0.22 * (1 - py / (size * 0.5)))
+            d = _round_rect_dist(px, py, 0, 0, size, size, size * 0.24)
+            if d > -1.5:
+                col = _mix(col, _rgb("#c4b5fd"), 0.7)
+            cov = 0.5 - d
+            out = _mix((11, 15, 25), col, cov) if cov > 0 else (11, 15, 25)
+            ts = tri_dist(px - 1.5, py - 1.5)                          # play symbol shadow
+            if cov > 0 and ts < 1.0:
+                out = _mix(out, (20, 10, 60), 0.5 * max(0.0, min(1.0, 0.5 - ts)))
+            td = tri_dist(px, py)
+            if cov > 0 and td < 0.5:
+                out = _mix(out, (255, 255, 255), max(0.0, min(1.0, 0.5 - td)))
+            row.append(out)
+        rows.append(row)
+    return _rows_to_photo(master, rows)
+
+def render_banner(master, w, h, left, mid, right):
+    """Horizontal 3-stop gradient with a glass sheen, rendered at half size then zoomed."""
+    hw, hh = max(2, w // 2), max(2, h // 2)
+    l_c, m_c, r_c = _rgb(left), _rgb(mid), _rgb(right)
+    cols = []
+    for x in range(hw):
+        t = x / max(1, hw - 1)
+        cols.append(_mix(l_c, m_c, t / 0.55) if t < 0.55 else _mix(m_c, r_c, (t - 0.55) / 0.45))
+    rows = []
+    for y in range(hh):
+        ty = y / max(1, hh - 1)
+        sheen = 0.16 * (1 - ty / 0.5) if ty < 0.5 else 0.0
+        shade = 0.25 * max(0.0, (ty - 0.6) / 0.4)
+        rows.append([_mix(_mix(c, (255, 255, 255), sheen), (0, 0, 0), shade) for c in cols])
+    return _rows_to_photo(master, rows).zoom(2, 2)
+
+
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.7.3"
+        self.version = "v1.8.0"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
-        self.root.geometry("1060x950")
+        self.root.geometry("1200x950")
         self.root.minsize(960, 820)
         self.root.configure(bg="#0b0f19")
 
@@ -133,11 +316,15 @@ class DownloaderApp:
         self.header_bar = tk.Frame(self.root, bg="#111827", height=54, highlightthickness=1, highlightbackground="#1f2937")
         self.header_bar.pack(side="top", fill="x")
 
-        self.back_btn = tk.Button(
-            self.header_bar, text="⬅️ Back", font=("Arial", 10, "bold"),
-            bg="#1e293b", fg="#f8fafc", activebackground="#334155", activeforeground="#ffffff",
-            relief="flat", padx=12, pady=5, cursor="hand2", command=self.navigate_back
-        )
+        # Generated glossy app icon (window + taskbar)
+        try:
+            self._app_icon = render_app_icon(self.root, 64)
+            self._app_icon_small = self._app_icon.subsample(2, 2)
+            self.root.iconphoto(True, self._app_icon, self._app_icon_small)
+        except Exception:
+            pass
+
+        self.back_btn = self.make_3d_pill(self.header_bar, "⬅️ Back", self.navigate_back, kind="blue")
         self.back_btn.pack(side="left", padx=(12, 8), pady=8)
 
         self.header_title_lbl = tk.Label(
@@ -159,14 +346,14 @@ class DownloaderApp:
             ("trim_crop", "✂️ Trim & Crop HD")
         ]
         for key, label in nav_items:
-            b = tk.Button(
-                nav_pills, text=label, font=("Arial", 9, "bold"),
-                bg="#1f2937", fg="#cbd5e1", activebackground="#2563eb", activeforeground="#ffffff",
-                relief="flat", padx=10, pady=5, cursor="hand2",
-                command=lambda k=key: self.show_page(k)
-            )
-            b.pack(side="left", padx=3, pady=8)
+            b = self.make_3d_pill(nav_pills, label, lambda k=key: self.show_page(k))
+            b.pack(side="left", padx=2, pady=8)
             self.nav_buttons[key] = b
+
+        # Nav pills get space first; a long page title is clipped instead of pushing the pills off-screen
+        self.header_title_lbl.pack_forget()
+        self.header_title_lbl.config(anchor="w")
+        self.header_title_lbl.pack(side="left", padx=6, fill="x", expand=True)
 
         # Main Page Container (All pages swap inside here — NO separate windows!)
         self.page_container = tk.Frame(self.root, bg="#0b0f19")
@@ -247,6 +434,157 @@ class DownloaderApp:
         style.map("TCombobox", fieldbackground=[("readonly", entry_bg)], foreground=[("readonly", "#ffffff")])
         style.configure("Horizontal.TProgressbar", troughcolor="#1e293b", background="#10b981", bordercolor="#1e293b", lightcolor="#10b981", darkcolor="#059669")
         style.configure("TSeparator", background="#1e293b")
+        try:
+            self.setup_3d_theme(style)
+        except Exception as e:
+            print(f"3D theme fallback to flat theme: {e}")
+
+    def setup_3d_theme(self, style):
+        """v1.8.0: swaps flat ttk parts for rendered 3D glass images (buttons, tabs, progress, checkboxes)."""
+        self._img3d = {}
+        R = self.root
+        BG = "#0e1422"
+
+        def btn_set(key, top, bot, edge, hov_top, hov_bot, press_top, press_bot):
+            self._img3d[key] = {
+                "n": render_glossy(R, 22, 24, top, bot, edge, BG, radius=6),
+                "a": render_glossy(R, 22, 24, hov_top, hov_bot, edge, BG, radius=6),
+                "p": render_glossy(R, 22, 24, press_top, press_bot, edge, BG, radius=6, pressed=True),
+                "d": render_glossy(R, 22, 24, "#141b2b", "#101624", "#1e293b", BG, radius=6, flat=True),
+            }
+            imgs = self._img3d[key]
+            el = f"G3D.{key}.border"
+            style.element_create(
+                el, "image", imgs["n"],
+                ("disabled", imgs["d"]), ("pressed", imgs["p"]), ("active", imgs["a"]),
+                border=(7, 7, 7, 8), padding=(1, 1, 1, 3), sticky="nsew"
+            )
+            return el
+
+        layouts = {
+            "TButton": btn_set("plain", "#334155", "#1e293b", "#475569", "#3f5270", "#26344d", "#1e293b", "#334155"),
+            "Accent.TButton": btn_set("accent", "#3b82f6", "#1d4ed8", "#60a5fa", "#60a5fa", "#2563eb", "#1d4ed8", "#3b82f6"),
+            "Danger.TButton": btn_set("danger", "#f43f5e", "#be123c", "#fb7185", "#fb7185", "#e11d48", "#be123c", "#f43f5e"),
+            "Success.TButton": btn_set("success", "#10b981", "#047857", "#34d399", "#34d399", "#059669", "#047857", "#10b981"),
+        }
+        for style_name, el in layouts.items():
+            style.layout(style_name, [(el, {"sticky": "nsew", "children": [
+                ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
+        style.configure("Success.TButton", foreground="#ffffff", font=("Arial", 9, "bold"), padding=(10, 5))
+        style.map("TButton", foreground=[("disabled", "#475569")])
+        style.map("Accent.TButton", foreground=[("disabled", "#475569")])
+        style.map("Danger.TButton", foreground=[("disabled", "#475569")])
+        style.map("Success.TButton", foreground=[("disabled", "#475569")])
+
+        # Notebook pill tabs
+        tab_n = render_glossy(R, 24, 30, "#1e293b", "#111827", "#334155", "#0b0f19", radius=9)
+        tab_a = render_glossy(R, 24, 30, "#2b3a55", "#172033", "#475569", "#0b0f19", radius=9)
+        tab_s = render_glossy(R, 24, 30, "#3b82f6", "#1e40af", "#93c5fd", "#0b0f19", radius=9)
+        self._img3d["tabs"] = (tab_n, tab_a, tab_s)
+        style.element_create("G3D.Notebook.tab", "image", tab_n, ("selected", tab_s), ("active", tab_a),
+                             border=(10, 10, 10, 10), padding=(4, 2, 4, 4), sticky="nsew")
+        style.layout("TNotebook.Tab", [("G3D.Notebook.tab", {"sticky": "nsew", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nsew", "children": [("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        style.configure("TNotebook", background="#0b0f19", borderwidth=0, tabmargins=(10, 4, 10, 0),
+                        bordercolor="#1e293b", lightcolor="#26324a", darkcolor="#05070d")
+        style.configure("TNotebook.Tab", padding=(12, 4), font=("Arial", 9, "bold"), foreground="#94a3b8", background="#0b0f19")
+        style.map("TNotebook.Tab", foreground=[("selected", "#ffffff"), ("active", "#e2e8f0")])
+
+        # Glass progress bar
+        trough = render_glossy(R, 24, 18, "#05070d", "#111827", "#1e293b", "#0e1422", radius=8, pressed=True, shadow=0)
+        pbar = render_glossy(R, 24, 18, "#34d399", "#047857", "#6ee7b7", "#05070d", radius=8, shadow=0)
+        self._img3d["progress"] = (trough, pbar)
+        style.element_create("G3D.Progress.trough", "image", trough, border=(8, 8, 8, 8), sticky="nsew")
+        style.element_create("G3D.Progress.pbar", "image", pbar, border=(8, 8, 8, 8), sticky="nsew")
+        style.layout("Horizontal.TProgressbar", [("G3D.Progress.trough", {"sticky": "nsew", "children": [
+            ("G3D.Progress.pbar", {"side": "left", "sticky": "ns"})]})])
+        style.configure("Horizontal.TProgressbar", thickness=18)
+
+        # 3D checkbox and radio indicators (rendered for the dark page and the card background)
+        for suffix, bg in (("", "#0b0f19"), ("Card.", "#131b2e"), ("Panel.", "#111a2c")):
+            ck = (render_check(R, 16, False, "#3b82f6", bg), render_check(R, 16, True, "#3b82f6", bg))
+            rd = (render_check(R, 16, False, "#3b82f6", bg, True), render_check(R, 16, True, "#3b82f6", bg, True))
+            self._img3d[f"check{suffix}"] = ck + rd
+            style.element_create(f"G3D.{suffix}check", "image", ck[0], ("selected", ck[1]), sticky="w", padding=(0, 0, 6, 0))
+            style.element_create(f"G3D.{suffix}radio", "image", rd[0], ("selected", rd[1]), sticky="w", padding=(0, 0, 6, 0))
+            for kind, el in (("TCheckbutton", f"G3D.{suffix}check"), ("TRadiobutton", f"G3D.{suffix}radio")):
+                base = "Checkbutton" if kind == "TCheckbutton" else "Radiobutton"
+                style.layout(f"{suffix}{kind}", [(f"{base}.padding", {"sticky": "nsew", "children": [
+                    (el, {"side": "left", "sticky": ""}),
+                    (f"{base}.focus", {"side": "left", "sticky": "w", "children": [(f"{base}.label", {"sticky": "nsew"})]})]})])
+        style.configure("Card.TCheckbutton", background="#131b2e", foreground="#f1f5f9", font=("Arial", 9))
+        style.configure("Card.TRadiobutton", background="#131b2e", foreground="#f1f5f9", font=("Arial", 9))
+        style.configure("Panel.TCheckbutton", background="#111a2c", foreground="#f1f5f9", font=("Arial", 9))
+        style.configure("Panel.TRadiobutton", background="#111a2c", foreground="#f1f5f9", font=("Arial", 9))
+        for s in ("Card.TCheckbutton", "Card.TRadiobutton"):
+            style.map(s, background=[("active", "#131b2e")])
+        for s in ("Panel.TCheckbutton", "Panel.TRadiobutton"):
+            style.map(s, background=[("active", "#111a2c")])
+
+        # Raised 3D panels: lighter top/left bevel, darker bottom/right
+        style.configure("TLabelframe", background="#131b2e", bordercolor="#24324d", lightcolor="#2c3b5b", darkcolor="#04060b", relief="raised", borderwidth=2)
+        style.configure("Panel.TFrame", background="#111a2c")
+        style.configure("Panel.TLabel", background="#111a2c", foreground="#f1f5f9")
+        style.configure("Muted.Panel.TLabel", background="#111a2c", foreground="#94a3b8", font=("Arial", 9))
+        style.configure("Title.Panel.TLabel", background="#111a2c", foreground="#ffffff", font=("Arial", 13, "bold"))
+        style.configure("Panel.TLabelframe", background="#111a2c", bordercolor="#24324d", lightcolor="#2c3b5b", darkcolor="#04060b", relief="raised", borderwidth=2)
+        style.configure("Panel.TLabelframe.Label", background="#111a2c", foreground="#38bdf8", font=("Arial", 10, "bold"))
+        style.configure("TEntry", bordercolor="#334155", lightcolor="#0b1220", darkcolor="#0b1220")
+        style.configure("TCombobox", bordercolor="#334155", lightcolor="#0b1220", darkcolor="#0b1220")
+        style.map("TCombobox", bordercolor=[("focus", "#3b82f6")])
+        style.configure("TSpinbox", fieldbackground="#1e293b", foreground="#ffffff", background="#1e293b",
+                        arrowcolor="#38bdf8", bordercolor="#334155", lightcolor="#0b1220", darkcolor="#0b1220")
+        style.map("TSpinbox", fieldbackground=[("readonly", "#1e293b")], foreground=[("readonly", "#ffffff")])
+        style.map("TEntry", bordercolor=[("focus", "#3b82f6")])
+
+    # --- 3D pill buttons for the header (tk.Button with a rendered glass image behind the text) ---
+    PILL_KINDS = {
+        "dark": ("#2b3648", "#161e2e", "#3b4a63"),
+        "hover": ("#3b4a63", "#1f2a3d", "#56657f"),
+        "blue": ("#4f8ff7", "#1d4ed8", "#93c5fd"),
+        "dim": ("#161e2e", "#111827", "#1f2937"),
+    }
+
+    def make_3d_pill(self, parent, text, command, kind="dark", bg="#111827"):
+        f = tkfont.Font(family="Arial", size=9, weight="bold")
+        w = f.measure(text) + 26
+
+        class LazyImgs(dict):
+            # Each state image is rendered the first time it is shown
+            def __missing__(d, k):
+                t, b, e = self.PILL_KINDS[k]
+                d[k] = render_glossy(self.root, w, 30, t, b, e, bg, radius=10)
+                return d[k]
+        imgs = LazyImgs()
+        btn = tk.Button(
+            parent, text=text, image=imgs[kind], compound="center", font=("Arial", 9, "bold"),
+            fg="#ffffff" if kind == "blue" else "#cbd5e1", disabledforeground="#475569",
+            bg=bg, activebackground=bg, activeforeground="#ffffff",
+            relief="flat", bd=0, highlightthickness=0, cursor="hand2", command=command
+        )
+        btn._imgs3d = imgs
+        btn._kind3d = kind
+        btn.bind("<Enter>", lambda e: btn._kind3d == "dark" and str(btn["state"]) != "disabled" and btn.config(image=imgs["hover"]))
+        btn.bind("<Leave>", lambda e: btn.config(image=imgs[btn._kind3d]))
+        return btn
+
+    def set_pill_kind(self, btn, kind):
+        btn._kind3d = kind
+        btn.config(image=btn._imgs3d[kind], fg="#ffffff" if kind == "blue" else "#cbd5e1")
+
+    def make_3d_badge(self, parent, glyph, color, bg="#111a2c", size=46):
+        """A glossy 3D app-style tile with a glyph on top, for section headers."""
+        c = tk.Canvas(parent, width=size, height=size + 3, bg=bg, highlightthickness=0)
+        top = _hexc(_mix(_rgb(color), (255, 255, 255), 0.18))
+        bot = _hexc(_mix(_rgb(color), (0, 0, 0), 0.45))
+        edge = _hexc(_mix(_rgb(color), (255, 255, 255), 0.45))
+        img = render_glossy(self.root, size, size + 3, top, bot, edge, bg, radius=12, shadow=3)
+        c._img3d = img
+        c.create_image(0, 0, image=img, anchor="nw")
+        c.create_text(size / 2 + 1, size / 2 + 1, text=glyph, fill="#0b0f19", font=("Arial", 17, "bold"))
+        c.create_text(size / 2, size / 2, text=glyph, fill="#ffffff", font=("Arial", 17, "bold"))
+        return c
+
 
     # =========================================================================
     # SINGLE-WINDOW PAGE ROUTER & BACK BUTTON
@@ -269,7 +607,7 @@ class DownloaderApp:
         self.current_page_name = page_name
 
         titles = {
-            "home": f"🎬 Nader Video Studio {self.version} — Main Downloader Dashboard",
+            "home": "🏠 Main Downloader Dashboard",
             "sync": "🎙️ Voice & Subtitle Sync Studio (Quick Timer & Auto 2D Sync)",
             "manual_edit": "🎛️ Full Manual 3-Track Edit Studio (Space = Play/Pause • Hold Shift = ✋ Move Track)",
             "queue": "🌙 Narto Drama 5-Movie Overnight Queue (Sequential 1-by-1)",
@@ -279,15 +617,14 @@ class DownloaderApp:
 
         # Highlight active navigation button
         for k, btn in self.nav_buttons.items():
-            if k == page_name:
-                btn.config(bg="#2563eb", fg="#ffffff")
-            else:
-                btn.config(bg="#1f2937", fg="#cbd5e1")
+            self.set_pill_kind(btn, "blue" if k == page_name else "dark")
 
         if page_name == "home":
-            self.back_btn.config(state="disabled", bg="#0f172a", fg="#475569")
+            self.set_pill_kind(self.back_btn, "dim")
+            self.back_btn.config(state="disabled")
         else:
-            self.back_btn.config(state="normal", bg="#2563eb", fg="#ffffff")
+            self.set_pill_kind(self.back_btn, "blue")
+            self.back_btn.config(state="normal")
 
         # Auto-populate video path when entering Sync or Manual Edit if empty
         if page_name == "sync" and not self.sync_vid_var.get().strip() and self.last_output_file and os.path.exists(self.last_output_file):
@@ -314,6 +651,9 @@ class DownloaderApp:
         self.sync_stop_flag = True
         self.stop_fme_live_playback()
         self.fme_close_popout(refresh_main=False)
+        for proc in list(getattr(self, "narto_claude_procs", ()) or ()):
+            try: proc.terminate()
+            except: pass
         if self.current_process:
             try: self.current_process.terminate()
             except: pass
@@ -329,161 +669,189 @@ class DownloaderApp:
         page = ttk.Frame(self.page_container)
         self.pages["home"] = page
 
-        # --- 1. SHORTMAX SECTION ---
-        self.lbl_shortmax = tk.Label(page, text="Shortmax.shorttw.live URL:", font=("Arial", 10, "bold", "underline"), bg="#0b0f19", fg="#38bdf8", cursor="hand2")
-        self.lbl_shortmax.pack(pady=(6, 1))
-        self.lbl_shortmax.bind("<Button-1>", lambda e: webbrowser.open("https://shortmax.shorttw.live"))
+        # --- 3D HERO BANNER WITH ENGINE HEALTH CHIPS ---
+        self.build_home_banner(page)
 
-        self.url_entry1 = self.create_url_row(page, source_id="1", width=58)
+        # --- SOURCE TABS (one glossy tab per site) ---
+        self.home_tabs = ttk.Notebook(page)
+        self.home_tabs.pack(fill="x", padx=14, pady=(8, 4))
+        self._tab_icons = []
 
-        btn_frame1 = ttk.Frame(page)
-        btn_frame1.pack(pady=2)
-        ttk.Button(btn_frame1, text="1. Verify Bot Check", command=lambda: self.open_browser(1)).grid(row=0, column=0, padx=5)
-        self.start_btn1 = ttk.Button(btn_frame1, text="2. Start Shortmax", style="Accent.TButton", command=lambda: self.start_thread(1))
+        def add_tab(title, color, glyph, heading, desc, link=None):
+            tab = ttk.Frame(self.home_tabs, style="Panel.TFrame", padding=(16, 10, 16, 12))
+            head = ttk.Frame(tab, style="Panel.TFrame")
+            head.pack(fill="x", pady=(0, 8))
+            self.make_3d_badge(head, glyph, color).pack(side="left", padx=(0, 12))
+            txt = ttk.Frame(head, style="Panel.TFrame")
+            txt.pack(side="left", fill="x")
+            ttk.Label(txt, text=heading, style="Title.Panel.TLabel").pack(anchor="w")
+            link_lbl = None
+            if link:
+                link_lbl = tk.Label(txt, text=link, font=("Arial", 9, "underline"), bg="#111a2c", fg="#38bdf8", cursor="hand2")
+                link_lbl.pack(anchor="w")
+                link_lbl.bind("<Button-1>", lambda e, u=link: webbrowser.open(u if u.startswith("http") else "https://" + u))
+            ttk.Label(txt, text=desc, style="Muted.Panel.TLabel").pack(anchor="w")
+            icon = render_sphere(self.root, 14, color, "#1a2338")
+            self._tab_icons.append(icon)
+            self.home_tabs.add(tab, text=f" {title}", image=icon, compound="left")
+            return tab, link_lbl
+
+        def btn_row(tab):
+            f = ttk.Frame(tab, style="Panel.TFrame")
+            f.pack(pady=(6, 0))
+            return f
+
+        # 1. SHORTMAX
+        tab, self.lbl_shortmax = add_tab(
+            "Shortmax", "#f97316", "S", "Shortmax Drama Downloader",
+            "Paste a watch link. Browser cookies are tried automatically (Chrome, Edge, Firefox…).",
+            link="https://shortmax.shorttw.live"
+        )
+        self.url_entry1 = self.create_url_row(tab, source_id="1", width=62, style="Panel.TFrame")
+        btn_frame1 = btn_row(tab)
+        ttk.Button(btn_frame1, text="🛡️ 1. Verify Bot Check", command=lambda: self.open_browser(1)).grid(row=0, column=0, padx=5)
+        self.start_btn1 = ttk.Button(btn_frame1, text="⬇️ 2. Start Shortmax", style="Accent.TButton", command=lambda: self.start_thread(1))
         self.start_btn1.grid(row=0, column=1, padx=5)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-
-        # --- 2. NARTO SECTION ---
-        self.lbl_narto = tk.Label(page, text="Download from narto-drama.com:", font=("Arial", 10, "bold", "underline"), bg="#0b0f19", fg="#38bdf8", cursor="hand2")
-        self.lbl_narto.pack(pady=1)
-        self.lbl_narto.bind("<Button-1>", lambda e: webbrowser.open("https://narto-drama.com"))
-
-        self.url_entry2 = self.create_url_row(page, source_id="2", width=58)
-
-        btn_frame2 = ttk.Frame(page)
-        btn_frame2.pack(pady=2)
+        # 2. NARTO (ORIGINAL ENGINE — logic untouched)
+        tab, self.lbl_narto = add_tab(
+            "Narto (Original)", "#ec4899", "N", "narto-drama.com — Original Engine",
+            "Your proven one-by-one downloader with token healing and merged .SRT subtitles.",
+            link="https://narto-drama.com"
+        )
+        self.url_entry2 = self.create_url_row(tab, source_id="2", width=62, style="Panel.TFrame")
+        btn_frame2 = btn_row(tab)
         self.start_btn2 = ttk.Button(btn_frame2, text="⬇️ Download Narto (Single)", style="Accent.TButton", command=lambda: self.start_thread(2))
         self.start_btn2.grid(row=0, column=0, padx=5)
         self.queue_narto_btn = ttk.Button(btn_frame2, text="🌙 Open 5-Movie Overnight Queue", command=lambda: self.show_page("queue"))
         self.queue_narto_btn.grid(row=0, column=1, padx=5)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
+        # 3. NARTO — CLAUDE VERSION (parallel turbo engine)
+        tab, _ = add_tab(
+            "Narto ⚡ Claude Version", "#a855f7", "⚡", "Narto-Drama.com — Claude Version (Turbo)",
+            "Downloads several episodes at once with 16 fragments each, auto-refreshing tokens. Same merge and .SRT output.",
+        )
+        self.url_entry7 = self.create_url_row(tab, source_id="7", width=62, style="Panel.TFrame")
+        btn_frame7 = btn_row(tab)
+        self.start_btn_narto_claude = ttk.Button(btn_frame7, text="🚀 Turbo Download (Claude Version)", style="Success.TButton", command=self.start_narto_claude_thread)
+        self.start_btn_narto_claude.grid(row=0, column=0, padx=5)
+        ttk.Label(btn_frame7, text="Episodes at once:", style="Panel.TLabel").grid(row=0, column=1, padx=(14, 4))
+        self.narto_claude_parallel_var = tk.IntVar(value=3)
+        ttk.Spinbox(btn_frame7, from_=1, to=6, width=4, textvariable=self.narto_claude_parallel_var, state="readonly").grid(row=0, column=2)
 
-        # --- 3. DAILYMOTION SECTION ---
-        self.lbl_dailymotion = tk.Label(page, text="Download from Dailymotion (Highest Quality):", font=("Arial", 10, "bold", "underline"), bg="#0b0f19", fg="#38bdf8", cursor="hand2")
-        self.lbl_dailymotion.pack(pady=1)
-        self.lbl_dailymotion.bind("<Button-1>", lambda e: webbrowser.open("https://www.dailymotion.com"))
-
-        self.url_entry5 = self.create_url_row(page, source_id="5", width=58)
-
-        btn_frame_dm = ttk.Frame(page)
-        btn_frame_dm.pack(pady=2)
+        # 4. DAILYMOTION
+        tab, self.lbl_dailymotion = add_tab(
+            "Dailymotion", "#0ea5e9", "d", "Dailymotion — Highest Quality",
+            "Best video + best audio, merged automatically.", link="https://www.dailymotion.com"
+        )
+        self.url_entry5 = self.create_url_row(tab, source_id="5", width=62, style="Panel.TFrame")
+        btn_frame_dm = btn_row(tab)
         self.start_btn_dm = ttk.Button(btn_frame_dm, text="⬇️ Download Dailymotion (Max Quality)", style="Accent.TButton", command=lambda: self.start_thread(5))
         self.start_btn_dm.grid(row=0, column=0, padx=5)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-
-        # --- 4. TIKTOK SECTION ---
-        self.lbl_tiktok = tk.Label(page, text="Download from TikTok (Single URL or Auto-Bulk File):", font=("Arial", 10, "bold", "underline"), bg="#0b0f19", fg="#38bdf8", cursor="hand2")
-        self.lbl_tiktok.pack(pady=1)
-        self.lbl_tiktok.bind("<Button-1>", lambda e: webbrowser.open("https://www.tiktok.com"))
-
-        self.url_entry4 = self.create_url_row(page, source_id="4", width=58)
-
-        btn_frame4 = ttk.Frame(page)
-        btn_frame4.pack(pady=2)
+        # 5. TIKTOK
+        tab, self.lbl_tiktok = add_tab(
+            "TikTok", "#14b8a6", "♪", "TikTok — Single URL or Auto-Bulk File",
+            "Bulk mode reads your 'tiktok link graber' text file.", link="https://www.tiktok.com"
+        )
+        self.url_entry4 = self.create_url_row(tab, source_id="4", width=62, style="Panel.TFrame")
+        btn_frame4 = btn_row(tab)
         self.start_btn4 = ttk.Button(btn_frame4, text="⬇️ Download Single TikTok", style="Accent.TButton", command=lambda: self.start_thread(4))
         self.start_btn4.grid(row=0, column=0, padx=5)
         self.start_btn5 = ttk.Button(btn_frame4, text="📦 Auto-Start Bulk TikTok ('tiktok link graber')", command=self.start_bulk_txt)
         self.start_btn5.grid(row=0, column=1, padx=5)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-
-        # --- 5. DIRECT BYPASS SECTION ---
-        ttk.Label(page, text="Direct M3U8/MP4 Bypass (Paste RAW .m3u8 file link here):", font=("Arial", 10, "bold")).pack(pady=1)
-
-        self.url_entry3 = self.create_url_row(page, source_id="3", width=58)
-
-        btn_frame3 = ttk.Frame(page)
-        btn_frame3.pack(pady=2)
+        # 6. DIRECT BYPASS
+        tab, _ = add_tab(
+            "Direct M3U8/MP4", "#22c55e", "▶", "Direct M3U8 / MP4 Bypass",
+            "Paste a RAW .m3u8 or .mp4 link copied from the browser's network tab."
+        )
+        self.url_entry3 = self.create_url_row(tab, source_id="3", width=62, style="Panel.TFrame")
+        btn_frame3 = btn_row(tab)
         self.start_btn3 = ttk.Button(btn_frame3, text="⬇️ Download Single Video", style="Accent.TButton", command=lambda: self.start_thread(3))
         self.start_btn3.grid(row=0, column=0, padx=5)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-
-        # --- 6. TORRENT & MAGNET SECTION (v1.7.3) — two compact rows so the dashboard still fits ---
-        tor_title_row = ttk.Frame(page)
-        tor_title_row.pack(pady=1)
-        ttk.Label(tor_title_row, text="🧲 Torrent & Magnet Downloader (Magnet, .torrent URL or File):", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
-        self.torrent_seed_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(tor_title_row, text="🌱 Keep Seeding (Ratio 1.0 / Max 30 min)", variable=self.torrent_seed_var).grid(row=0, column=1, padx=5)
-
-        tor_row = ttk.Frame(page)
+        # 7. TORRENT & MAGNET
+        tab, _ = add_tab(
+            "Torrent / Magnet", "#eab308", "⇣", "Torrent & Magnet Downloader (Aria2c 16x)",
+            "Magnet link, info-hash, .torrent URL or local file. DHT + PEX + public trackers for peer boosting."
+        )
+        tor_row = ttk.Frame(tab, style="Panel.TFrame")
         tor_row.pack(pady=1)
-        self.url_entry6 = self.build_url_controls_in_frame(tor_row, source_id="6", width=38)
+        self.url_entry6 = self.build_url_controls_in_frame(tor_row, source_id="6", width=50)
         ttk.Button(tor_row, text="📄 Browse", width=9, command=self.browse_torrent_file).grid(row=0, column=4, padx=2)
-        self.start_btn_torrent = ttk.Button(tor_row, text="🧲 Download (Aria2c 16x)", style="Accent.TButton", command=self.start_torrent_thread)
-        self.start_btn_torrent.grid(row=0, column=5, padx=(6, 0))
+        btn_frame6 = btn_row(tab)
+        self.start_btn_torrent = ttk.Button(btn_frame6, text="🧲 Download Torrent / Magnet", style="Accent.TButton", command=self.start_torrent_thread)
+        self.start_btn_torrent.grid(row=0, column=0, padx=5)
+        self.torrent_seed_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_frame6, text="🌱 Keep Seeding After Download (Ratio 1.0 / Max 30 min)", variable=self.torrent_seed_var, style="Panel.TCheckbutton").grid(row=0, column=1, padx=10)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
+        # --- GLOBAL SETTINGS & ACCELERATOR (raised 3D card) ---
+        settings_card = ttk.LabelFrame(page, text="⚙️ Download Settings, Sync-Lock & Subtitles", padding=(12, 6))
+        settings_card.pack(fill="x", padx=14, pady=4)
 
-        # --- GLOBAL SETTINGS & ACCELERATOR ---
-        ttk.Label(page, text="Download Settings, Sync-Lock & Subtitles:", font=("Arial", 10, "bold")).pack(pady=1)
-
-        settings_frame = ttk.Frame(page)
+        settings_frame = ttk.Frame(settings_card, style="Card.TFrame")
         settings_frame.pack(pady=2)
 
-        ttk.Label(settings_frame, text="Start Ep:", font=("Arial", 10)).grid(row=0, column=0, padx=5)
+        ttk.Label(settings_frame, text="Start Ep:", font=("Arial", 10), background="#131b2e").grid(row=0, column=0, padx=5)
         self.start_entry = ttk.Entry(settings_frame, width=8)
         self.start_entry.grid(row=0, column=1, padx=5)
         self.start_entry.insert(0, "1")
 
-        ttk.Label(settings_frame, text="Total Eps (Auto-Stop):", font=("Arial", 10)).grid(row=0, column=2, padx=5)
+        ttk.Label(settings_frame, text="Total Eps (Auto-Stop):", font=("Arial", 10), background="#131b2e").grid(row=0, column=2, padx=5)
         self.total_entry = ttk.Entry(settings_frame, width=8)
         self.total_entry.grid(row=0, column=3, padx=5)
 
         self.turbo_var = tk.BooleanVar(value=True)
         self.turbo_check = ttk.Checkbutton(
-            page,
-            text="⚡ Enable Turbo Download Accelerator (16x Threads + Chunk Boost / Aria2c)",
-            variable=self.turbo_var
+            settings_frame,
+            text="⚡ Turbo Accelerator (16x Threads + Chunk Boost / Aria2c)",
+            variable=self.turbo_var, style="Card.TCheckbutton"
         )
-        self.turbo_check.pack(pady=1)
+        self.turbo_check.grid(row=0, column=4, padx=(18, 5))
 
-        opts_row = ttk.Frame(page)
-        opts_row.pack(pady=1)
+        opts_row = ttk.Frame(settings_card, style="Card.TFrame")
+        opts_row.pack(pady=2)
         self.sync_lock_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             opts_row,
             text="🔒 Sync-Lock Audio/Video On Every Episode & Merge (Prevents Middle Drift)",
-            variable=self.sync_lock_var
+            variable=self.sync_lock_var, style="Card.TCheckbutton"
         ).grid(row=0, column=0, padx=6)
 
         self.auto_sub_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             opts_row,
             text="📝 Auto-Save Merged .SRT Subtitles (Narto)",
-            variable=self.auto_sub_var
+            variable=self.auto_sub_var, style="Card.TCheckbutton"
         ).grid(row=0, column=1, padx=6)
 
         # --- PRO STUDIO LAUNCHPAD (OPENS INSIDE SAME WINDOW) ---
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-        studio_lbl = tk.Label(page, text="✨ Pro Video Studios (Opens Inside This Window — Use Top Bar or Back Button Anytime):", font=("Arial", 10, "bold"), bg="#0b0f19", fg="#a855f7")
-        studio_lbl.pack(pady=1)
-
-        studio_frame = ttk.Frame(page)
-        studio_frame.pack(pady=3)
+        studio_card = ttk.LabelFrame(page, text="✨ Pro Video Studios (Open Inside This Window — Use Top Bar or Back Anytime)", padding=(12, 6))
+        studio_card.pack(fill="x", padx=14, pady=4)
+        studio_frame = ttk.Frame(studio_card, style="Card.TFrame")
+        studio_frame.pack(pady=2)
 
         ttk.Button(studio_frame, text="🎙️ 1. Voice & Subtitle Sync Studio", style="Accent.TButton", command=lambda: self.show_page("sync")).grid(row=0, column=0, padx=5, pady=2)
         ttk.Button(studio_frame, text="🎛️ 2. Full Manual Edit (3-Track NLE)", style="Accent.TButton", command=lambda: self.show_page("manual_edit")).grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(studio_frame, text="🌙 3. Narto 5-Movie Overnight Queue", command=lambda: self.show_page("queue")).grid(row=0, column=2, padx=5, pady=2)
         ttk.Button(studio_frame, text="✂️ 4. HD Trim & Crop Studio", command=lambda: self.show_page("trim_crop")).grid(row=0, column=3, padx=5, pady=2)
 
-        ttk.Separator(page, orient='horizontal').pack(fill='x', padx=20, pady=4)
-
         # --- LIVE STATUS & PROGRESS METRICS ---
-        self.status_label = tk.Label(page, text="Ready to download", font=("Arial", 11, "bold"), bg="#0b0f19", fg="#38bdf8")
-        self.status_label.pack(pady=(2, 2))
+        status_card = ttk.LabelFrame(page, text="📡 Live Status", padding=(12, 6))
+        status_card.pack(fill="x", padx=14, pady=4)
 
-        self.progress_bar = ttk.Progressbar(page, orient='horizontal', mode='determinate', length=560)
+        self.status_label = tk.Label(status_card, text="Ready to download", font=("Arial", 12, "bold"), bg="#131b2e", fg="#38bdf8")
+        self.status_label.pack(pady=(2, 4))
+
+        self.progress_bar = ttk.Progressbar(status_card, orient='horizontal', mode='determinate', length=640)
         self.progress_bar.pack(pady=2)
 
-        self.detail_label = tk.Label(page, text="", font=("Courier", 9), bg="#0b0f19", fg="#94a3b8")
-        self.detail_label.pack(pady=(0, 2))
+        self.detail_label = tk.Label(status_card, text="", font=("Courier", 9), bg="#131b2e", fg="#94a3b8")
+        self.detail_label.pack(pady=(2, 4))
 
         # --- CONTROLS ---
-        control_frame = ttk.Frame(page)
+        control_frame = ttk.Frame(status_card, style="Card.TFrame")
         control_frame.pack(pady=2)
 
         self.stop_btn = ttk.Button(control_frame, text="🛑 Stop Download", style="Danger.TButton", command=self.stop_download, state="disabled")
@@ -495,9 +863,59 @@ class DownloaderApp:
         self.stitch_btn = ttk.Button(control_frame, text="🔗 Stitch Multiple Videos", command=self.stitch_videos)
         self.stitch_btn.grid(row=0, column=2, padx=4, pady=2)
 
-        ttk.Button(control_frame, text="▶️ Open Last File", command=self.open_last_file).grid(row=1, column=0, padx=4, pady=2)
-        ttk.Button(control_frame, text="📂 Open Last Local Folder", command=self.open_last_local_folder).grid(row=1, column=1, padx=4, pady=2)
-        ttk.Button(control_frame, text="📜 Open Error Log", command=self.open_log).grid(row=1, column=2, padx=4, pady=2)
+        ttk.Button(control_frame, text="▶️ Open Last File", command=self.open_last_file).grid(row=0, column=3, padx=4, pady=2)
+        ttk.Button(control_frame, text="📂 Open Last Local Folder", command=self.open_last_local_folder).grid(row=0, column=4, padx=4, pady=2)
+        ttk.Button(control_frame, text="📜 Open Error Log", command=self.open_log).grid(row=0, column=5, padx=4, pady=2)
+
+    def build_home_banner(self, page):
+        h = 76
+        c = tk.Canvas(page, height=h, bg="#0b0f19", highlightthickness=0)
+        c.pack(fill="x", padx=14, pady=(10, 2))
+        bw = max(1200, min(2200, self.root.winfo_screenwidth()))
+        left, mid, right = "#1e3a8a", "#5b21b6", "#111827"
+        self._banner_img = render_banner(self.root, bw, h, left, mid, right)
+        self._banner_logo = getattr(self, "_app_icon", None) or render_app_icon(self.root, 64)
+        c.create_image(0, 0, image=self._banner_img, anchor="nw")
+        c.create_line(0, 0, bw, 0, fill="#93c5fd")
+        c.create_line(0, h - 1, bw, h - 1, fill="#020617")
+        c.create_image(18, h // 2, image=self._banner_logo, anchor="w")
+        for dx, col in ((2, "#020617"), (0, "#ffffff")):
+            c.create_text(94 + dx, 26 + dx, text="Nader Video Studio", font=("Arial", 19, "bold"), fill=col, anchor="w")
+        c.create_text(96, 54, text="Download  •  Sync  •  Edit  •  Torrent   —   Created by Nader Alkhansa", font=("Arial", 9), fill="#c7d2fe", anchor="w")
+
+        # Version chip, placed after the title and blended onto the banner colour under it
+        chip_x = 94 + tkfont.Font(family="Arial", size=19, weight="bold").measure("Nader Video Studio") + 14
+        t = (chip_x + 30) / bw
+        chip_bg = _hexc(_mix(_rgb(left), _rgb(mid), t / 0.55))
+        self._banner_ver = render_glossy(self.root, 62, 22, "#34d399", "#047857", "#6ee7b7", chip_bg, radius=10, shadow=2)
+        c.create_image(chip_x, 26, image=self._banner_ver, anchor="w")
+        c.create_text(chip_x + 31, 25, text=self.version, font=("Arial", 9, "bold"), fill="#ffffff")
+
+        # Engine health chips on the right (green = found, red = missing)
+        yt = self.get_yt_dlp_path()
+        engines = [
+            ("yt-dlp", bool(yt and os.path.exists(yt))),
+            ("ffmpeg", bool(shutil.which("ffmpeg") or shutil.which("ffmpeg.exe"))),
+            ("aria2c", bool(self.get_aria2c_path())),
+            ("curl", bool(shutil.which("curl") or shutil.which("curl.exe"))),
+        ]
+        self._banner_chips = []
+        for name, ok in engines:
+            txt = f"{'✓' if ok else '✗'} {name}"
+            w = tkfont.Font(family="Arial", size=9, weight="bold").measure(txt) + 20
+            img = render_glossy(self.root, w, 24, *(("#10b981", "#065f46", "#6ee7b7") if ok else ("#f43f5e", "#9f1239", "#fda4af")), right, radius=11, shadow=2)
+            self._banner_chips.append((img, txt, w))
+
+        def place_chips(event=None):
+            c.delete("chips")
+            x = c.winfo_width() - 16
+            for img, txt, w in reversed(self._banner_chips):
+                x -= w
+                c.create_image(x, h // 2, image=img, anchor="w", tags="chips")
+                c.create_text(x + w / 2, h // 2 - 1, text=txt, font=("Arial", 9, "bold"), fill="#ffffff", tags="chips")
+                x -= 6
+        c.bind("<Configure>", place_chips)
+
 
     # =========================================================================
     # PAGE 1: 🎙️ VOICE & SUBTITLE SYNC STUDIO (IN-WINDOW)
@@ -1125,7 +1543,7 @@ class DownloaderApp:
             ttk.Button(ph_btn_row, text=lbl_b, width=7, command=lambda d=d_s: self.fme_step_playhead(d)).pack(side="left", padx=1)
 
         ttk.Button(
-            ph_btn_row, text="🔍 Pop-Out Monitor", style="Accent.TButton", width=17,
+            ph_btn_row, text="🔍 Pop-Out", style="Accent.TButton",
             command=self.fme_toggle_popout
         ).pack(side="left", padx=(10, 1))
 
@@ -2194,9 +2612,10 @@ class DownloaderApp:
                     )
                 ))
             except Exception as ex:
+                err_txt = str(ex)
                 self.fme_prog.stop()
                 self.stop_fme_btn.config(state="disabled")
-                self.root.after(0, lambda: self.fme_status.config(text=f"Error: {str(ex)}", fg="#f43f5e"))
+                self.root.after(0, lambda: self.fme_status.config(text=f"Error: {err_txt}", fg="#f43f5e"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3267,7 +3686,7 @@ class DownloaderApp:
                 pass
 
     def load_history(self):
-        default_hist = {"1": [], "2": [], "3": [], "4": [], "5": [], "6": []}
+        default_hist = {"1": [], "2": [], "3": [], "4": [], "5": [], "6": [], "7": []}
         if os.path.exists(self.history_file):
             try:
                 with open(self.history_file, "r", encoding="utf-8") as f:
@@ -3296,8 +3715,8 @@ class DownloaderApp:
         if s_id in self.url_widgets:
             self.url_widgets[s_id]['values'] = self.link_history[s_id]
 
-    def create_url_row(self, parent, source_id, width=48):
-        row_frame = ttk.Frame(parent)
+    def create_url_row(self, parent, source_id, width=48, style="TFrame"):
+        row_frame = ttk.Frame(parent, style=style)
         row_frame.pack(pady=1)
         return self.build_url_controls_in_frame(row_frame, source_id, width=width)
 
@@ -3363,6 +3782,87 @@ class DownloaderApp:
             return os.path.join(self.base_dir, "venv", "Scripts", "yt-dlp.exe")
         else:
             return os.path.join(self.base_dir, "venv", "bin", "yt-dlp")
+
+    def get_fast_accelerator_args(self):
+        """v1.8.0 speed profile for Shortmax, Dailymotion, TikTok and Direct (Narto Original keeps get_accelerator_args).
+        HLS/DASH go through yt-dlp's native downloader with 16 parallel fragments (faster and safer than aria2c
+        for segmented streams); plain files go through aria2c with 16 connections."""
+        if not self.turbo_var.get():
+            return self.get_accelerator_args()
+        args = ["-N", "16", "--buffer-size", "1M", "--http-chunk-size", "10M",
+                "--retries", "10", "--fragment-retries", "10", "--newline"]
+        aria_path = self.get_aria2c_path()
+        if aria_path:
+            args.extend([
+                "--downloader", aria_path,
+                "--downloader", "m3u8,dash:native",
+                "--downloader-args", "aria2c:-x 16 -s 16 -k 1M --file-allocation=none --max-tries=5 --retry-wait=1 --summary-interval=1"
+            ])
+        return args
+
+    # --- Shortmax: cookie + browser-impersonation fallback chain (v1.8.0) ---
+    SHORTMAX_COOKIE_ERR = re.compile(
+        r"(could not (find|copy)[^\n]*cookie|failed to decrypt|dpapi|cookie[^\n]*(locked|permission)|"
+        r"unsupported browser|keyring|could not find [a-z]+ cookies database)", re.IGNORECASE
+    )
+
+    def shortmax_cookie_chain(self):
+        chain = []
+        cookie_file = os.path.join(self.base_dir, "shortmax_cookies.txt")
+        if os.path.exists(cookie_file):
+            chain.append(["--cookies", cookie_file])
+        browsers = ["chrome", "edge", "firefox", "brave", "opera"]
+        if sys.platform == "darwin":
+            browsers.insert(0, "safari")
+        chain += [["--cookies-from-browser", b] for b in browsers]
+        chain.append([])  # last resort: no cookies
+        return chain
+
+    def shortmax_impersonate_available(self, yt_dlp_path):
+        cached = getattr(self, "_sm_impersonate_ok", None)
+        if cached is not None:
+            return cached
+        ok = False
+        try:
+            kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+            res = subprocess.run([yt_dlp_path, "--list-impersonate-targets"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="ignore", timeout=40, **kwargs)
+            for ln in (res.stdout or "").splitlines():
+                if ln.strip().lower().startswith("chrome") and "unavailable" not in ln.lower():
+                    ok = True
+                    break
+        except Exception:
+            ok = False
+        self._sm_impersonate_ok = ok
+        if not ok:
+            self.log_message("Shortmax: browser impersonation unavailable (curl_cffi missing) — continuing without it. "
+                             "For best results use the official yt-dlp.exe or: pip install \"yt-dlp[default,curl-cffi]\"")
+        return ok
+
+    def shortmax_auth_args(self, yt_dlp_path):
+        chain = self.shortmax_cookie_chain()
+        idx = min(getattr(self, "_sm_cookie_idx", 0), len(chain) - 1)
+        args = list(chain[idx])
+        if self.shortmax_impersonate_available(yt_dlp_path):
+            args += ["--impersonate", "chrome", "--extractor-args", "generic:impersonate"]
+        return args
+
+    def shortmax_recover_from_error(self, err):
+        """True when the failure was cookies/impersonation and the next attempt uses a different setup."""
+        if "impersonate target" in err.lower() and getattr(self, "_sm_impersonate_ok", None):
+            self._sm_impersonate_ok = False
+            self.log_message("Shortmax: impersonation failed, retrying without it.")
+            return True
+        if self.SHORTMAX_COOKIE_ERR.search(err):
+            chain = self.shortmax_cookie_chain()
+            idx = getattr(self, "_sm_cookie_idx", 0)
+            if idx < len(chain) - 1:
+                self._sm_cookie_idx = idx + 1
+                nxt = " ".join(chain[idx + 1]) or "no cookies"
+                self.log_message(f"Shortmax: cookie source failed ({' '.join(chain[idx])}). Trying: {nxt}")
+                self.update_status(f"Shortmax: trying cookies from {nxt.replace('--cookies-from-browser ', '')}...", "orange")
+                return True
+        return False
 
     def get_accelerator_args(self, use_aria=True):
         if not self.turbo_var.get():
@@ -3485,6 +3985,7 @@ class DownloaderApp:
         self.start_btn5.config(state="normal")
         self.start_btn_dm.config(state="normal")
         self.start_btn_torrent.config(state="normal")
+        self.start_btn_narto_claude.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.stitch_btn.config(state="normal")
         self.merge_btn.config(state="normal")
@@ -3499,6 +4000,7 @@ class DownloaderApp:
         self.start_btn5.config(state="disabled")
         self.start_btn_dm.config(state="disabled")
         self.start_btn_torrent.config(state="disabled")
+        self.start_btn_narto_claude.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.stitch_btn.config(state="disabled")
         self.merge_btn.config(state="disabled")
@@ -3530,6 +4032,9 @@ class DownloaderApp:
     def stop_download(self):
         self.stop_flag = True
         self.update_status("Stopping... (Canceling active task)", "#f43f5e")
+        for proc in list(getattr(self, "narto_claude_procs", ()) or ()):
+            try: proc.terminate()
+            except: pass
         if self.current_process:
             try:
                 self.current_process.terminate()
@@ -3708,7 +4213,7 @@ class DownloaderApp:
             downloaded_files = []
             episode = start_ep
             last_saved_ep = None
-            accel_args = self.get_accelerator_args()
+            accel_args = self.get_fast_accelerator_args()
 
             for url in urls_to_download:
                 if self.stop_flag:
@@ -3843,6 +4348,335 @@ class DownloaderApp:
             self.log_message(f"Thread dispatch error: {str(e)}")
             self.update_status("URL formatting error. Check log.", "#f43f5e")
             self.reset_buttons()
+
+    # =========================================================================
+    # ⚡ NARTO-DRAMA.COM — CLAUDE VERSION (PARALLEL TURBO ENGINE) — v1.8.0
+    # Reuses the original engine's read-only helpers (page scraper, stream candidates,
+    # refresh-source token healing, subtitle finder) but downloads several episodes at
+    # once, skips the fixed waits, and refreshes tokens before they go stale.
+    # The original Narto engine (download_process, source 2) is not changed.
+    # =========================================================================
+    NARTO_CLAUDE_TOKEN_MAX_AGE = 120  # seconds before the playlist (and its stream tokens) is re-fetched
+    NARTO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+    def start_narto_claude_thread(self):
+        self.stop_flag = False
+
+        if self.current_run_log:
+            self.previous_runs_log = self.current_run_log + "\n\n" + self.previous_runs_log
+            self.current_run_log = ""
+
+        raw_url = self.url_entry7.get().strip()
+        if not raw_url:
+            messagebox.showerror("Error", "Please enter a narto-drama.com watch URL")
+            return
+
+        url = self.sanitize_url(raw_url)
+        self.save_to_history(7, url)
+        try:
+            workers = max(1, min(6, int(self.narto_claude_parallel_var.get())))
+        except Exception:
+            workers = 3
+        self.disable_buttons_for_run()
+        self.log_message(f"{'='*50}\n--- STARTING NARTO CLAUDE VERSION ({workers} episodes at once) ---\nURL: {url}")
+        threading.Thread(target=self.narto_claude_process, args=(url, workers), daemon=True).start()
+
+    def narto_claude_accel_args(self, is_hls, workers):
+        if not self.turbo_var.get():
+            return ["-N", "4", "--newline"]
+        # Spread connections over the parallel episodes so the CDN is not flooded (≈32 in total)
+        frags = min(16, max(6, 32 // max(1, workers)))
+        args = ["-N", str(frags), "--buffer-size", "1M", "--retries", "10", "--fragment-retries", "10", "--newline"]
+        aria_path = self.get_aria2c_path()
+        if aria_path and not is_hls:
+            args += ["--downloader", aria_path, "--downloader-args", "aria2c:-x 16 -s 16 -k 1M --file-allocation=none --max-tries=5 --retry-wait=1"]
+        return args
+
+    def run_ytdlp_tracked(self, cmd, on_pct):
+        """Runs one yt-dlp download (several can run at once). Returns (ok, last output lines)."""
+        tail = []
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                    encoding="utf-8", errors="ignore", **kwargs)
+        except Exception as e:
+            return False, str(e)
+        self.narto_claude_procs.add(proc)
+        try:
+            for line in proc.stdout:
+                if self.stop_flag:
+                    proc.terminate()
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                tail.append(line)
+                if len(tail) > 25:
+                    tail.pop(0)
+                m = re.search(r'(\d+(?:\.\d+)?)%', line)
+                if m and ("[download]" in line or "DL:" in line):
+                    try: on_pct(float(m.group(1)))
+                    except: pass
+            proc.wait()
+        finally:
+            self.narto_claude_procs.discard(proc)
+        return (proc.returncode == 0 and not self.stop_flag), "\n".join(tail)
+
+    def narto_claude_process(self, url, workers):
+        t0 = time.time()
+        self.narto_claude_procs = set()
+        net_lock = threading.Lock()     # curl shares one cookie jar file: one page/API request at a time
+        state_lock = threading.Lock()
+        ui = lambda fn: self.root.after(0, fn)
+        ticker = {"on": True}
+
+        def set_status(text, color="blue"):
+            ui(lambda: self.update_status(text, color))
+
+        try:
+            yt_dlp_path = self.get_yt_dlp_path()
+            if not yt_dlp_path or not os.path.exists(yt_dlp_path):
+                set_status("Error: yt-dlp engine missing. Run terminal setup.", "red")
+                return
+
+            parsed = urllib.parse.urlparse(url)
+            domain = parsed.netloc or "narto-drama.com"
+            path_parts = [p for p in parsed.path.split('/') if p]
+            if not path_parts:
+                set_status("Error: Invalid Narto URL structure", "red")
+                return
+            if path_parts[-1].isdigit():
+                path_parts.pop()
+            series_slug = path_parts[-1] if path_parts else "Unknown_Series"
+            series_name = f"Narto_Series_{series_slug}".replace('-', '_').title()
+            base_watch_path = "/" + "/".join(path_parts)
+
+            target_dir = self.get_organized_output_dir(series_name, "1_Downloaded_Merged")
+            temp_dir = os.path.join(target_dir, f"temp_claude_{series_name}")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            start_val = self.start_entry.get().strip()
+            start_ep = int(start_val) if start_val.isdigit() and int(start_val) > 0 else 1
+            total_val = self.total_entry.get().strip()
+            total_target = int(total_val) if total_val.isdigit() else None
+
+            set_status("⚡ Claude Turbo: loading series data...")
+            with net_lock:
+                meta = self.scrape_webpage_playlist(domain, base_watch_path, start_ep, bust_cache=True)
+            shared = {"meta": meta, "ep": start_ep, "fetched": time.time()}
+
+            ep_numbers = set()
+            for it in (meta.get("playlist") or []):
+                for n in (it.get("route_episode_number"), it.get("number")):
+                    if str(n).isdigit():
+                        ep_numbers.add(int(n))
+            if total_target:
+                last_ep = total_target
+            elif ep_numbers:
+                last_ep = max(ep_numbers)
+            elif meta.get("direct_url"):
+                last_ep = start_ep
+            else:
+                set_status("Could not read the episode list. Try the Original engine tab.", "red")
+                self.log_message(f"Narto Claude: no playlist found on {meta.get('page_url')}")
+                return
+            if last_ep < start_ep:
+                set_status(f"Nothing to download: Total Eps ({last_ep}) is below Start Ep ({start_ep}).", "red")
+                return
+
+            total_eps = last_ep - start_ep + 1
+            self.log_message(f"Narto Claude: episodes {start_ep}-{last_ep} ({total_eps}), {workers} at once.")
+
+            def current_meta(ep, force=False):
+                with net_lock:
+                    if force or time.time() - shared["fetched"] > self.NARTO_CLAUDE_TOKEN_MAX_AGE:
+                        m = self.scrape_webpage_playlist(domain, base_watch_path, ep, bust_cache=True)
+                        if m.get("playlist") or m.get("direct_url"):
+                            shared.update(meta=m, ep=ep, fetched=time.time())
+                            self.log_message(f"Narto Claude: tokens refreshed (page ep {ep}).")
+                    return shared["meta"], shared["ep"]
+
+            def candidates_for(ep, force=False):
+                m, page_ep = current_meta(ep, force)
+                return self.collect_narto_candidates(m.get("playlist"), ep, m.get("direct_url", "") if page_ep == ep else "")
+
+            progress = {}      # ep -> percent for running downloads
+            results = {}       # ep -> "ok" | "locked" | "failed" | "stopped"
+            subs_raw = {}      # ep -> raw subtitle text
+            errors = {}
+            sched = {"next": start_ep, "stop_at": last_ep}
+
+            def download_episode(ep):
+                cands = candidates_for(ep)
+                if not cands:
+                    cands = candidates_for(ep, force=True)
+                if not cands:
+                    self.log_message(f"Narto Claude: Episode {ep} is Locked/VIP or unavailable.")
+                    return "locked"
+
+                file_name = os.path.join(temp_dir, f"ep_{ep:03d}.mp4")
+                for leftover in (file_name, file_name + ".part"):
+                    if os.path.exists(leftover):
+                        try: os.remove(leftover)
+                        except: pass
+
+                tried = set()
+                for attempt in range(5):
+                    if self.stop_flag:
+                        return "stopped"
+                    stream = next((u for u in cands if u not in tried), cands[-1])
+                    is_hls = ".m3u8" in stream.lower() or "dbxhls" in stream.lower()
+                    cmd = [yt_dlp_path, "--user-agent", self.NARTO_UA, "--referer", f"https://{domain}/",
+                           *self.narto_claude_accel_args(is_hls, workers), "-o", file_name, stream]
+                    ok, err = self.run_ytdlp_tracked(cmd, lambda p, e=ep: progress.__setitem__(e, p))
+                    if self.stop_flag:
+                        return "stopped"
+                    if ok and self.is_valid_video_file(file_name):
+                        self.normalize_clip_for_sync(file_name)
+                        if self.auto_sub_var.get():
+                            with net_lock:
+                                m, page_ep = shared["meta"], shared["ep"]
+                                sub_u = self.extract_narto_subtitle_url(domain, m.get("playlist"), ep, m.get("raw_html", "") if page_ep == ep else "")
+                                if sub_u:
+                                    subs_raw[ep] = self.curl_fetch(sub_u, headers={"Referer": f"https://{domain}/"})
+                        return "ok"
+
+                    if os.path.exists(file_name):
+                        try: os.remove(file_name)
+                        except: pass
+                    tried.add(stream)
+                    errors[ep] = err or "Downloaded file was invalid or <100KB."
+                    if any(code in errors[ep] for code in ("410", "500", "403", "404", "invalid")):
+                        self.log_message(f"Narto Claude: Ep {ep} stream rejected, healing token via refresh-source...")
+                        with net_lock:
+                            page_copy = dict(shared["meta"])
+                            fresh = self.trigger_narto_refresh_source(domain, base_watch_path, ep, page_copy, stream)
+                            if page_copy.get("playlist"):
+                                shared["meta"] = dict(shared["meta"], playlist=page_copy["playlist"])
+                                shared["fetched"] = time.time()
+                        for fc in fresh:
+                            if fc not in cands:
+                                cands.append(fc)
+                        if any(u not in tried for u in cands):
+                            continue
+                    time.sleep(1.0)
+                self.log_message(f"Narto Claude: Episode {ep} failed after retries:\n{errors.get(ep, '')}")
+                return "failed"
+
+            def worker(delay):
+                time.sleep(delay)  # stagger starts so the site isn't hit all at once
+                while not self.stop_flag:
+                    with state_lock:
+                        ep = sched["next"]
+                        if ep > sched["stop_at"]:
+                            return
+                        sched["next"] += 1
+                        progress[ep] = 0.0
+                    try:
+                        res = download_episode(ep)
+                    except Exception as e:
+                        errors[ep] = str(e)
+                        res = "failed"
+                    with state_lock:
+                        results[ep] = res
+                        progress.pop(ep, None)
+                        if res != "ok":
+                            # Like the original: never merge past a missing episode
+                            sched["stop_at"] = min(sched["stop_at"], ep - 1)
+
+            def tick():
+                if not ticker["on"]:
+                    return
+                with state_lock:
+                    done = sum(1 for r in results.values() if r == "ok")
+                    running = sorted(progress.items())
+                frac = sum(p for _, p in running) / 100.0
+                pct = min(100.0, (done + frac) / max(1, total_eps) * 100.0)
+                self.progress_bar['value'] = pct
+                elapsed = int(time.time() - t0)
+                self.status_label.config(text=f"⚡ Claude Turbo: {done}/{total_eps} episodes done  •  {elapsed // 60}:{elapsed % 60:02d}", fg="#a855f7")
+                self.detail_label.config(text="   ".join(f"Ep {e} ▸ {p:.0f}%" for e, p in running[:6]) or "Preparing...")
+                self.root.after(300, tick)
+            ui(tick)
+
+            threads = [threading.Thread(target=worker, args=(i * 0.6,), daemon=True) for i in range(workers)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            ticker["on"] = False
+
+            ok_eps = []
+            e = start_ep
+            while results.get(e) == "ok":
+                ok_eps.append(e)
+                e += 1
+
+            if not ok_eps:
+                if self.stop_flag:
+                    set_status("Stopped. No complete episodes to merge.", "orange")
+                else:
+                    set_status(f"Ep {start_ep} failed. Check log.", "red")
+                    self.log_message(f"Narto Claude FAILED ON EPISODE {start_ep}:\n{errors.get(start_ep, results.get(start_ep, ''))}")
+                return
+
+            first, last = ok_eps[0], ok_eps[-1]
+            set_status(f"⚡ Merging {len(ok_eps)} sync-locked episodes (Ep {first}-Ep {last})...", "orange")
+            files = [os.path.join(temp_dir, f"ep_{n:03d}.mp4") for n in ok_eps]
+
+            if first == 1 and last == last_ep and last > 1 and not self.stop_flag:
+                final_output = os.path.join(target_dir, f"{series_name}_Full_Claude.mp4")
+            elif first == last:
+                final_output = os.path.join(target_dir, f"{series_name}_EP{first}_Claude.mp4")
+            else:
+                final_output = os.path.join(target_dir, f"{series_name}_EP{first}-EP{last}_Claude.mp4")
+
+            # Subtitles: shift each episode's cues by the running duration, in episode order
+            merged_cues = []
+            offset = 0.0
+            for n, fpath in zip(ok_eps, files):
+                if subs_raw.get(n):
+                    merged_cues.extend(self.parse_and_shift_subtitle_cues(subs_raw[n], offset))
+                offset += self.get_media_duration(fpath)
+
+            res = self.concat_video_files_synced(files, final_output, normalize_first=False)
+            if res.returncode != 0:
+                self.log_message(f"Narto Claude FFMPEG ERROR:\n{res.stderr}")
+                set_status("Merge failed. Episodes kept in the temp folder. Check log.", "red")
+                return
+
+            self.record_last_output(final_output)
+            for fpath in files:
+                try: os.remove(fpath)
+                except: pass
+            try: os.rmdir(temp_dir)
+            except: pass
+
+            if merged_cues:
+                srt_output = os.path.splitext(final_output)[0] + ".srt"
+                try:
+                    with open(srt_output, "w", encoding="utf-8") as sf:
+                        for idx_cue, (st, et, txt) in enumerate(merged_cues, 1):
+                            sf.write(f"{idx_cue}\n{st} --> {et}\n{txt}\n\n")
+                    self.log_message(f"Narto Claude SUBTITLES SAVED: {srt_output} ({len(merged_cues)} lines)")
+                except Exception as sub_ex:
+                    self.log_message(f"Subtitle save warning: {str(sub_ex)}")
+
+            took = time.time() - t0
+            ep_txt = f"Ep {first}" if first == last else f"Ep {first}-{last}"
+            prefix = "⏹️ Stopped — kept" if self.stop_flag else "✅ Claude Turbo:"
+            summary = f"{prefix} {ep_txt} merged in {int(took // 60)}m {int(took % 60)}s ({took / len(ok_eps):.1f}s per episode)"
+            self.log_message(f"{summary}\nCOMPLETED: Saved to {final_output}")
+            ui(lambda: (self.update_status(summary, "green"), self.progress_bar.configure(value=100)))
+
+        except Exception:
+            import traceback
+            self.log_message(f"Narto Claude CRASH:\n{traceback.format_exc()}")
+            set_status("Narto Claude stopped on an error. Check log.", "red")
+        finally:
+            ticker["on"] = False
+            self.narto_claude_procs = set()
+            ui(self.reset_buttons)
 
     # =========================================================================
     # 🧲 TORRENT & MAGNET LINK DOWNLOADER (ARIA2C 16x ENGINE) — v1.7.3
@@ -4316,6 +5150,9 @@ class DownloaderApp:
                 return
 
             accel_args = self.get_accelerator_args()
+            if source != 2:
+                # v1.8.0 speed profile; Narto Original (source 2) keeps its proven settings
+                accel_args = self.get_fast_accelerator_args()
 
             # --- DIRECT M3U8 BYPASS LOGIC ---
             if source == 3:
@@ -4535,7 +5372,7 @@ class DownloaderApp:
 
                 success = False
                 err = ""
-                max_retries = 4
+                max_retries = 9 if source == 1 else 4
                 tried_dead_urls = set()
 
                 for attempt in range(max_retries):
@@ -4547,9 +5384,7 @@ class DownloaderApp:
                     if source == 1:
                         yt_dlp_cmd = [
                             yt_dlp_path,
-                            "--cookies-from-browser", "chrome",
-                            "--impersonate", "chrome",
-                            "--extractor-args", "generic:impersonate",
+                            *self.shortmax_auth_args(yt_dlp_path),
                             "--referer", f"https://{domain}/",
                             *accel_args,
                             "-o", file_name, current_stream_url
@@ -4597,6 +5432,9 @@ class DownloaderApp:
                                 except: pass
                             err = stderr if stderr else "Downloaded file was invalid or <100KB."
                             tried_dead_urls.add(current_stream_url)
+
+                            if source == 1 and self.shortmax_recover_from_error(err):
+                                continue
 
                             if source == 2 and any(code in err for code in ("410", "500", "403", "404", "invalid")):
                                 err_snippet = next((line for line in err.splitlines() if "HTTP Error" in line), "Stream Expired/Error")
