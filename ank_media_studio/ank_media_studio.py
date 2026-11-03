@@ -60,10 +60,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QToolButton, QLabel, QFileDialog, QSlider, QTabWidget, QComboBox,
     QMessageBox, QScrollArea, QStatusBar, QCheckBox, QMenu,
     QDoubleSpinBox, QSpinBox, QLineEdit,
-    QFormLayout, QProgressDialog, QColorDialog, QButtonGroup, QFrame, QSizePolicy,
+    QFormLayout, QProgressDialog, QColorDialog, QButtonGroup, QFrame, QSizePolicy, QListWidget, QListWidgetItem,
+    QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox, QProgressBar,
     QAbstractSpinBox
 )
-from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QPoint, QPointF, QSize, pyqtSignal, QObject, QElapsedTimer, QBuffer, QByteArray, QIODevice
+from PyQt6.QtCore import QSettings, Qt, QTimer, QRect, QRectF, QPoint, QPointF, QSize, pyqtSignal, QObject, QElapsedTimer, QBuffer, QByteArray, QIODevice
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QPen, QFont, QBrush, QKeySequence, QShortcut,
     QIcon, QLinearGradient, QPainterPath, QFontMetrics
@@ -98,7 +99,7 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # APPLICATION METADATA & VERSION CONTROL
 # ==============================================================================
 APP_NAME = "ANK Media Studio"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 APP_AUTHOR = "Nader Alkhansa"
 
 # Expanded 12-Color Palette so every added video has its own unmistakable identity
@@ -587,7 +588,9 @@ class AudioStemProcessor:
         return voices, music, noise
 
     @staticmethod
-    def envelope(arr: np.ndarray, bins: int = 400) -> np.ndarray:
+    def envelope(arr: np.ndarray, bins: int = 0, sr: int = 44100) -> np.ndarray:
+        if bins <= 0:
+            bins = int(min(200000, max(400, (len(arr) if arr is not None else 0) / sr * 40)))
         if arr is None or len(arr) < bins:
             return np.zeros(bins, dtype=np.float32)
         mono = np.abs(arr[:, 0])
@@ -626,6 +629,7 @@ class TransformParams:
         t.ai_upscale = self.ai_upscale
         t.transparent_bg = self.transparent_bg
         t.bg_replacement = self.bg_replacement.copy() if self.bg_replacement is not None else None
+        t.bg_path = getattr(self, "bg_path", None)
         return t
 
     def reset(self):
@@ -1080,6 +1084,968 @@ class FrameReader:
 
 
 # ==============================================================================
+# v3 ENGINES: LAYERS, MUSIC, SUBTITLES, TRANSITIONS, MOTION, COMPOSITOR, AI TOOLS
+# ==============================================================================
+import json
+import importlib.util
+from collections import OrderedDict
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+TRANSITION_TYPES = [("none", "None (hard cut)"), ("crossfade", "Crossfade"), ("black", "Dip to Black"),
+                    ("white", "Flash to White"), ("slide", "Slide Left"), ("zoom", "Zoom Blend")]
+MOTION_TYPES = [("none", "None"), ("zoom_in", "Slow Zoom In"), ("zoom_out", "Slow Zoom Out"),
+                ("pan_right", "Pan Right"), ("pan_left", "Pan Left")]
+OUTPUT_PRESETS = [
+    # (title, size or None=source, fps or None=source, framing, recommended max seconds)
+    ("Custom", None, None, None, None),
+    ("TikTok  (9:16 · 1080×1920)", (1080, 1920), 30, "smart", 600),
+    ("Instagram Reels  (9:16)", (1080, 1920), 30, "smart", 180),
+    ("YouTube Shorts  (9:16)", (1080, 1920), 30, "smart", 180),
+    ("YouTube  (16:9 · 1080p)", (1920, 1080), None, "blur", None),
+    ("Instagram Post  (4:5)", (1080, 1350), 30, "blur", 60),
+    ("Square  (1:1)", (1080, 1080), 30, "blur", None),
+]
+
+
+def has_module(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def cache_dir() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
+    d = os.path.join(base, "ANK_Media_Studio")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def load_image_bgra(path: str):
+    try:
+        img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    except Exception:
+        return None
+    if img is None:
+        return None
+    if img.dtype != np.uint8:
+        img = cv2.convertScaleAbs(img, alpha=255.0 / max(1.0, float(img.max())))
+    return to_bgra(img)
+
+
+def alpha_blit(dst_bgr: np.ndarray, src_bgra: np.ndarray, cx: float, cy: float, opacity: float = 1.0, dst_alpha=None):
+    """Pastes a BGRA image centred at (cx, cy) pixels, clipped to the frame, with opacity."""
+    H, W = dst_bgr.shape[:2]
+    h, w = src_bgra.shape[:2]
+    x0, y0 = int(round(cx - w / 2)), int(round(cy - h / 2))
+    sx0, sy0 = max(0, -x0), max(0, -y0)
+    dx0, dy0 = max(0, x0), max(0, y0)
+    dx1, dy1 = min(W, x0 + w), min(H, y0 + h)
+    if dx1 <= dx0 or dy1 <= dy0:
+        return dst_bgr
+    src = src_bgra[sy0:sy0 + (dy1 - dy0), sx0:sx0 + (dx1 - dx0)]
+    a = (src[:, :, 3:4].astype(np.float32) / 255.0) * float(opacity)
+    region = dst_bgr[dy0:dy1, dx0:dx1].astype(np.float32)
+    dst_bgr[dy0:dy1, dx0:dx1] = (region * (1 - a) + src[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+    if dst_alpha is not None:
+        reg_a = dst_alpha[dy0:dy1, dx0:dx1].astype(np.float32)
+        dst_alpha[dy0:dy1, dx0:dx1] = np.maximum(reg_a, a[:, :, 0] * 255.0).astype(np.uint8)
+    return dst_bgr
+
+
+# --- Overlay layers (logo, watermark, picture-in-picture video) ---
+class OverlayItem:
+    POSITIONS = {"Top Left": (0.14, 0.12), "Top Right": (0.86, 0.12), "Bottom Left": (0.14, 0.86),
+                 "Bottom Right": (0.86, 0.86), "Center": (0.5, 0.5)}
+
+    def __init__(self, path: str = ""):
+        self.path = path
+        self.kind = "video" if os.path.splitext(path)[1].lower() in VIDEO_EXTS else "image"
+        self.start_ms = 0
+        self.end_ms = None          # None = until the end
+        self.cx, self.cy = 0.86, 0.12
+        self.width_pct = 22.0
+        self.opacity = 1.0
+        self._img = None
+        self._scaled = {}
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    def active(self, t_ms: int) -> bool:
+        return t_ms >= self.start_ms and (self.end_ms is None or t_ms < self.end_ms)
+
+    def image_bgra(self):
+        if self._img is None and self.kind == "image":
+            self._img = load_image_bgra(self.path)
+        return self._img
+
+    def scaled_for(self, img: np.ndarray, frame_w: int) -> np.ndarray:
+        tw = max(4, int(frame_w * self.width_pct / 100.0))
+        th = max(4, int(img.shape[0] * tw / img.shape[1]))
+        return cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA if tw < img.shape[1] else cv2.INTER_LINEAR)
+
+    def to_dict(self):
+        return {"path": self.path, "start_ms": self.start_ms, "end_ms": self.end_ms, "cx": self.cx, "cy": self.cy,
+                "width_pct": self.width_pct, "opacity": self.opacity}
+
+    @staticmethod
+    def from_dict(d):
+        o = OverlayItem(d["path"])
+        for k in ("start_ms", "end_ms", "cx", "cy", "width_pct", "opacity"):
+            setattr(o, k, d.get(k, getattr(o, k)))
+        return o
+
+    def clone(self):
+        c = OverlayItem.from_dict(self.to_dict())
+        c._img = self._img
+        return c
+
+
+# --- Background music track with auto-ducking under voices ---
+class MusicTrack:
+    def __init__(self, path: str = ""):
+        self.path = path
+        self.start_ms = 0
+        self.volume = 0.6
+        self.loop = True
+        self.duck = 0.3            # music level while someone speaks (1.0 = no ducking)
+        self.fade_in_ms = 1000
+        self.fade_out_ms = 2000
+        self._audio = None         # (sr, float stereo)
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    def audio(self):
+        if self._audio is None and self.path:
+            tmp = os.path.join(tempfile.gettempdir(), f"ank_music_{os.getpid()}.wav")
+            if AudioStemProcessor.extract_wav(self.path, tmp):
+                try:
+                    self._audio = read_wav_float(tmp)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        return self._audio
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in ("path", "start_ms", "volume", "loop", "duck", "fade_in_ms", "fade_out_ms")}
+
+    @staticmethod
+    def from_dict(d):
+        m = MusicTrack(d.get("path", ""))
+        for k, v in d.items():
+            if hasattr(m, k) and not k.startswith("_"):
+                setattr(m, k, v)
+        return m
+
+    def clone(self):
+        c = MusicTrack.from_dict(self.to_dict())
+        c._audio = self._audio
+        return c
+
+
+# --- Subtitles ---
+def format_srt_time(ms: int) -> str:
+    ms = max(0, int(ms))
+    return f"{ms // 3600000:02d}:{(ms // 60000) % 60:02d}:{(ms // 1000) % 60:02d},{ms % 1000:03d}"
+
+
+def subtitles_to_srt(cues) -> str:
+    return "\n".join(f"{i}\n{format_srt_time(c['start'])} --> {format_srt_time(c['end'])}\n{c['text'].strip()}\n"
+                     for i, c in enumerate(cues, 1))
+
+
+def parse_srt(text: str):
+    cues = []
+    pat = re.compile(r"((?:\d{1,2}:)?\d{1,2}:\d{2}[,\.]\d{1,3})\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}[,\.]\d{1,3})")
+
+    def to_ms(t):
+        t = t.replace(",", ".")
+        parts = t.split(":")
+        sec = float(parts[-1])
+        mins = int(parts[-2]) if len(parts) >= 2 else 0
+        hrs = int(parts[-3]) if len(parts) >= 3 else 0
+        return int(round((hrs * 3600 + mins * 60 + sec) * 1000))
+    for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip()):
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        for i, ln in enumerate(lines):
+            m = pat.search(ln)
+            if m:
+                body = "\n".join(lines[i + 1:]).strip()
+                if body:
+                    cues.append({"start": to_ms(m.group(1)), "end": to_ms(m.group(2)), "text": body})
+                break
+    return sorted(cues, key=lambda c: c["start"])
+
+
+def subtitle_at(cues, t_ms: int):
+    for c in cues:
+        if c["start"] <= t_ms < c["end"]:
+            return c
+    return None
+
+
+WHISPER_LANGS = [("auto", "Auto-detect"), ("en", "English"), ("ar", "Arabic"), ("zh", "Chinese"), ("ko", "Korean"),
+                 ("ja", "Japanese"), ("es", "Spanish"), ("fr", "French"), ("de", "German"), ("tr", "Turkish"),
+                 ("hi", "Hindi"), ("ru", "Russian"), ("pt", "Portuguese"), ("it", "Italian"), ("th", "Thai"),
+                 ("id", "Indonesian"), ("vi", "Vietnamese"), ("fa", "Persian"), ("ur", "Urdu")]
+
+
+def whisper_engine_name() -> str:
+    if has_module("faster_whisper"):
+        return "faster-whisper"
+    if has_module("whisper"):
+        return "openai-whisper"
+    return ""
+
+
+def transcribe_audio(wav_path: str, model_size="small", language="auto", task="transcribe", progress=None, cancel=None):
+    """Speech-to-text with timestamps. Returns [{'start','end','text'}] in ms. Runs fully on this computer."""
+    engine = whisper_engine_name()
+    lang = None if language == "auto" else language
+    cues = []
+    if engine == "faster-whisper":
+        from faster_whisper import WhisperModel
+        try:
+            model = WhisperModel(model_size, device="auto", compute_type="auto")
+        except Exception:
+            model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        # Pass decoded samples (16 kHz mono) so faster-whisper never needs its own PyAV decoder,
+        # which breaks with some PyAV versions ("unexpected keyword argument 'metadata_errors'")
+        sr, audio = read_wav_float(wav_path)
+        mono = audio.mean(axis=1).astype(np.float32)
+        if sr != 16000:
+            mono = np.interp(np.linspace(0, len(mono) - 1, int(len(mono) * 16000 / sr)), np.arange(len(mono)), mono).astype(np.float32)
+        segments, info = model.transcribe(mono, language=lang, task=task, vad_filter=True, beam_size=5)
+        total = max(1.0, float(getattr(info, "duration", 0) or 1.0))
+        for seg in segments:
+            if cancel and cancel():
+                break
+            text = seg.text.strip()
+            if text:
+                cues.append({"start": int(seg.start * 1000), "end": int(seg.end * 1000), "text": text})
+            if progress:
+                progress(min(1.0, seg.end / total), len(cues))
+    elif engine == "openai-whisper":
+        import whisper
+        model = whisper.load_model(model_size)
+        res = model.transcribe(wav_path, language=lang, task=task)
+        for seg in res.get("segments", []):
+            text = seg["text"].strip()
+            if text:
+                cues.append({"start": int(seg["start"] * 1000), "end": int(seg["end"] * 1000), "text": text})
+        if progress:
+            progress(1.0, len(cues))
+    else:
+        raise RuntimeError("No speech-to-text engine installed.\n\nInstall one with:\n    pip install faster-whisper")
+    return split_long_cues(cues)
+
+
+def split_long_cues(cues, max_chars=42):
+    """Breaks long lines into two-line subtitles that are easy to read on phones."""
+    out = []
+    for c in cues:
+        words = c["text"].split()
+        if len(c["text"]) <= max_chars * 2:
+            lines, cur = [], ""
+            for w in words:
+                if len(cur) + len(w) + 1 > max_chars and cur:
+                    lines.append(cur)
+                    cur = w
+                else:
+                    cur = f"{cur} {w}".strip()
+            lines.append(cur)
+            out.append({**c, "text": "\n".join(lines[:2]) + (" " + " ".join(lines[2:]) if len(lines) > 2 else "")})
+            continue
+        chunks, cur = [], []
+        for w in words:
+            cur.append(w)
+            if len(" ".join(cur)) >= max_chars * 2:
+                chunks.append(" ".join(cur))
+                cur = []
+        if cur:
+            chunks.append(" ".join(cur))
+        span = (c["end"] - c["start"]) / max(1, len(chunks))
+        for i, ch in enumerate(chunks):
+            out.extend(split_long_cues([{"start": int(c["start"] + i * span), "end": int(c["start"] + (i + 1) * span), "text": ch}], max_chars))
+    return out
+
+
+def argos_languages():
+    if not has_module("argostranslate"):
+        return []
+    try:
+        from argostranslate import translate as at
+        return [(l.code, l.name) for l in at.get_installed_languages()]
+    except Exception:
+        return []
+
+
+def translate_cues(cues, src: str, dst: str):
+    from argostranslate import translate as at
+    langs = {l.code: l for l in at.get_installed_languages()}
+    if src not in langs or dst not in langs:
+        raise RuntimeError(f"Language pack {src} → {dst} is not installed in Argos Translate.")
+    tr = langs[src].get_translation(langs[dst])
+    return [{**c, "text": tr.translate(c["text"])} for c in cues]
+
+
+# --- Demucs AI stem separation ---
+def demucs_available() -> bool:
+    return has_module("demucs")
+
+
+def demucs_separate(wav_path: str, sr: int, progress=None, cancel=None):
+    """Runs Demucs (htdemucs, vocals vs. everything else) in a child process. Returns (vocals, accompaniment)."""
+    out_dir = tempfile.mkdtemp(prefix="ank_demucs_")
+    cmd = [sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs", "-o", out_dir, wav_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+    buf = b""
+    try:
+        while True:
+            ch = proc.stdout.read(64)
+            if not ch:
+                break
+            buf = (buf + ch)[-400:]
+            m = re.findall(rb"(\d{1,3})%\|", buf)
+            if m and progress:
+                progress(min(1.0, int(m[-1]) / 100.0))
+            if cancel and cancel():
+                proc.kill()
+                raise RuntimeError("Cancelled")
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError("Demucs failed:\n" + buf.decode("utf-8", "ignore")[-600:])
+        stem = os.path.splitext(os.path.basename(wav_path))[0]
+        base = os.path.join(out_dir, "htdemucs", stem)
+        _, vocals = read_wav_float(os.path.join(base, "vocals.wav"))
+        _, rest = read_wav_float(os.path.join(base, "no_vocals.wav"))
+        return vocals, rest
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# --- Real-ESRGAN (optional ncnn executable) ---
+def find_realesrgan(custom: str = ""):
+    names = ["realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan"]
+    for cand in ([custom] if custom else []) + [os.path.join(APP_DIR, n) for n in names] + \
+            [os.path.join(APP_DIR, "realesrgan", n) for n in names]:
+        if cand and os.path.isfile(cand):
+            return cand
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def realesrgan_upscale(exe: str, bgr: np.ndarray, scale: int = 4, anime: bool = False) -> np.ndarray:
+    tmp = tempfile.mkdtemp(prefix="ank_esr_")
+    try:
+        src, dst = os.path.join(tmp, "in.png"), os.path.join(tmp, "out.png")
+        cv2.imwrite(src, bgr)
+        model = "realesrgan-x4plus-anime" if anime else "realesrgan-x4plus"
+        res = run_quiet([exe, "-i", src, "-o", dst, "-s", str(scale), "-n", model], cwd=os.path.dirname(exe))
+        out = cv2.imread(dst, cv2.IMREAD_COLOR)
+        if res.returncode != 0 or out is None:
+            raise RuntimeError(res.stderr.decode("utf-8", "ignore")[-400:] or "Real-ESRGAN failed")
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --- Face tracking for smart vertical reframing ---
+_FACE_CASCADE = None
+
+
+def _face_cascade():
+    global _FACE_CASCADE
+    if _FACE_CASCADE is None:
+        try:
+            path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+            c = cv2.CascadeClassifier(path)
+            _FACE_CASCADE = c if not c.empty() else False
+        except Exception:
+            _FACE_CASCADE = False
+    return _FACE_CASCADE or None
+
+
+def compute_face_track(path: str, fps: float, duration_ms: int, sample_fps: float = 4.0, cancel=None):
+    """Horizontal centre of the main face over time (0..1), smoothed so the camera glides instead of jumping."""
+    cascade = _face_cascade()
+    times, xs = [], []
+    if cascade is None or duration_ms <= 0:
+        return np.array([0, max(1, duration_ms)]), np.array([0.5, 0.5])
+    reader = FrameReader(path, fps)
+    step = 1000.0 / sample_fps
+    last = 0.5
+    t = 0.0
+    while t < duration_ms:
+        if cancel and cancel():
+            break
+        fr = reader.frame_at_ms(t)
+        if fr is None:
+            break
+        h, w = fr.shape[:2]
+        s = 320.0 / w
+        g = cv2.cvtColor(cv2.resize(fr, (320, max(1, int(h * s)))), cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(g, scaleFactor=1.15, minNeighbors=5, minSize=(18, 18))
+        if len(faces):
+            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            last = (x + fw / 2) / 320.0
+        times.append(t)
+        xs.append(last)
+        t += step
+    reader.release()
+    if not xs:
+        return np.array([0, max(1, duration_ms)]), np.array([0.5, 0.5])
+    xs = np.array(xs, dtype=np.float32)
+    k = max(1, int(sample_fps * 1.2))                     # ~1.2 s moving average
+    pad = np.pad(xs, (k, k), mode="edge")
+    smooth = np.convolve(pad, np.ones(2 * k + 1) / (2 * k + 1), mode="same")[k:-k]
+    return np.array(times, dtype=np.float32), smooth
+
+
+def smart_crop(img: np.ndarray, out_w: int, out_h: int, center_x: float) -> np.ndarray:
+    """Crops to the output aspect around a horizontal centre (0..1), then scales to the output size."""
+    h, w = img.shape[:2]
+    target = out_w / out_h
+    if w / h > target:
+        cw = int(round(h * target))
+        x0 = int(round(center_x * w - cw / 2))
+        x0 = max(0, min(w - cw, x0))
+        crop = img[:, x0:x0 + cw]
+    else:
+        ch = int(round(w / target))
+        y0 = max(0, (h - ch) // 2)
+        crop = img[y0:y0 + ch, :]
+    return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA if crop.shape[1] > out_w else cv2.INTER_LINEAR)
+
+
+# --- Scene & silence detection ---
+def detect_scene_cuts(path: str, fps: float, in_ms: int, out_ms: int, sensitivity: float = 0.5, progress=None, cancel=None):
+    """Source times (ms) where the picture changes abruptly (hard cuts)."""
+    reader = FrameReader(path, fps)
+    step = 1000.0 / min(fps, 12.0)
+    thr = 0.55 - 0.35 * sensitivity            # higher sensitivity → lower threshold
+    prev = None
+    cuts = []
+    t = float(in_ms)
+    span = max(1, out_ms - in_ms)
+    last_cut = -1e9
+    while t < out_ms:
+        if cancel and cancel():
+            break
+        fr = reader.frame_at_ms(t)
+        if fr is None:
+            break
+        small = cv2.resize(fr, (96, 54))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+        if prev is not None:
+            diff = cv2.compareHist(prev, hist, cv2.HISTCMP_BHATTACHARYYA)
+            if diff > thr and t - last_cut > 700:
+                cuts.append(int(t))
+                last_cut = t
+        prev = hist
+        if progress:
+            progress((t - in_ms) / span)
+        t += step
+    reader.release()
+    return cuts
+
+
+def detect_silences(audio: np.ndarray, sr: int, threshold_db: float = -40.0, min_len_ms: int = 600, pad_ms: int = 150):
+    """Timeline ranges (ms) quieter than threshold_db for at least min_len_ms, shrunk by pad_ms on each side."""
+    win = int(sr * 0.02)
+    n = len(audio) // win
+    if n == 0:
+        return []
+    frames = audio[:n * win].reshape(n, win, 2)
+    rms = np.sqrt((frames ** 2).mean(axis=(1, 2)) + 1e-12)
+    db = 20 * np.log10(rms)
+    quiet = db < threshold_db
+    ranges, start = [], None
+    for i, q in enumerate(np.append(quiet, False)):
+        if q and start is None:
+            start = i
+        elif not q and start is not None:
+            a, b = start * 20, i * 20
+            if b - a >= min_len_ms:
+                a2, b2 = a + pad_ms, b - pad_ms
+                if b2 - a2 > 50:
+                    ranges.append((a2, b2))
+            start = None
+    return ranges
+
+
+# --- Encoders (GPU when available) ---
+_ENCODERS = None
+ENCODER_LABELS = [("auto", "Auto (GPU if available)"), ("libx264", "CPU — x264 (best compatibility)"),
+                  ("h264_nvenc", "NVIDIA GPU (NVENC)"), ("h264_qsv", "Intel GPU (QuickSync)"), ("h264_amf", "AMD GPU (AMF)")]
+
+
+def available_encoders():
+    """Encoders that really work on this computer (a tiny test encode for each GPU encoder)."""
+    global _ENCODERS
+    if _ENCODERS is not None:
+        return _ENCODERS
+    found = []
+    if FFMPEG_EXE:
+        try:
+            listed = run_quiet([FFMPEG_EXE, "-hide_banner", "-encoders"], timeout=20).stdout.decode("utf-8", "ignore")
+        except Exception:
+            listed = ""
+        for enc in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+            if enc not in listed:
+                continue
+            if enc == "libx264":
+                found.append(enc)
+                continue
+            try:
+                r = run_quiet([FFMPEG_EXE, "-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.2",
+                               "-c:v", enc, "-f", "null", "-"], timeout=25)
+                if r.returncode == 0:
+                    found.append(enc)
+            except Exception:
+                pass
+    _ENCODERS = found
+    return found
+
+
+def pick_encoder(choice: str) -> str:
+    avail = available_encoders()
+    if choice == "auto":
+        for enc in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+            if enc in avail:
+                return enc
+        return "mpeg4"
+    return choice if choice in avail else ("libx264" if "libx264" in avail else "mpeg4")
+
+
+def encoder_args(enc: str, crf: int):
+    if enc == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if enc == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-global_quality", str(crf), "-pix_fmt", "nv12"]
+    if enc == "h264_amf":
+        return ["-c:v", "h264_amf", "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-pix_fmt", "yuv420p"]
+    if enc == "libx264":
+        return ["-c:v", "libx264", "-preset", "faster", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    return ["-c:v", "mpeg4", "-q:v", "3"]
+
+
+# --- Motion (Ken Burns) and transitions ---
+def motion_transform(tf: "TransformParams", motion: dict, progress: float, cw: int, ch: int) -> "TransformParams":
+    kind = (motion or {}).get("type", "none")
+    if kind == "none":
+        return tf
+    a = max(0.02, min(0.6, motion.get("amount", 20) / 100.0))
+    p = max(0.0, min(1.0, progress))
+    p = p * p * (3 - 2 * p)                     # ease in/out
+    t = tf.clone()
+    if kind == "zoom_in":
+        t.scale *= 1 + a * p
+    elif kind == "zoom_out":
+        t.scale *= 1 + a * (1 - p)
+    elif kind in ("pan_right", "pan_left"):
+        t.scale *= 1 + a
+        d = a * cw / 2
+        t.offset_x += int(d * (1 - 2 * p) * (1 if kind == "pan_right" else -1))
+    return t
+
+
+def blend_transition(out_img: np.ndarray, in_img: np.ndarray, w_in: float, kind: str) -> np.ndarray:
+    w = max(0.0, min(1.0, w_in))
+    if kind == "black" or kind == "white":
+        tone = np.zeros_like(out_img) if kind == "black" else np.full_like(out_img, 255)
+        return cv2.addWeighted(out_img, 1 - 2 * w, tone, 2 * w, 0) if w < 0.5 else cv2.addWeighted(in_img, 2 * w - 1, tone, 2 - 2 * w, 0)
+    if kind == "slide":
+        W = out_img.shape[1]
+        off = int(round(w * W))
+        res = np.empty_like(out_img)
+        res[:, :W - off] = out_img[:, off:]
+        res[:, W - off:] = in_img[:, :off]
+        return res
+    if kind == "zoom":
+        H, W = out_img.shape[:2]
+        z = 1 + 0.35 * w
+        zw, zh = int(W / z), int(H / z)
+        x0, y0 = (W - zw) // 2, (H - zh) // 2
+        zoomed = cv2.resize(out_img[y0:y0 + zh, x0:x0 + zw], (W, H))
+        return cv2.addWeighted(zoomed, 1 - w, in_img, w, 0)
+    return cv2.addWeighted(out_img, 1 - w, in_img, w, 0)
+
+
+# --- Clip frame processing (shared by preview, snapshots and export) ---
+def process_clip_frame(frame: np.ndarray, seg, canvas_wh, preview_mode=True, scale=1.0, local_ms=None) -> np.ndarray:
+    cw, ch = canvas_wh
+    crop = seg.crop_rect
+    tf = seg.transform
+    if local_ms is not None and seg.motion.get("type", "none") != "none":
+        tf = motion_transform(tf, seg.motion, local_ms / max(1, seg.duration_ms), cw, ch)
+    tw, th = max(1, int(cw * scale)), max(1, int(ch * scale))
+    if scale < 0.999 or frame.shape[1] != cw or frame.shape[0] != ch:
+        # Works for downscaled previews and for low-resolution proxy files alike
+        frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_AREA if frame.shape[1] > tw else cv2.INTER_LINEAR)
+        if scale < 0.999:
+            if crop:
+                crop = tuple(int(round(v * scale)) for v in crop)
+            tf = tf.scaled(scale)
+        cw, ch = tw, th
+
+    if crop:
+        x, y, w, h = crop
+        fh, fw = frame.shape[:2]
+        frame = frame[max(0, y):min(fh, y + h), max(0, x):min(fw, x + w)]
+        if frame.size == 0:
+            frame = np.zeros((ch, cw, 3), np.uint8)
+        frame = fit_into_frame(frame, cw, ch, "fit")
+
+    if tf.transparent_bg:
+        if HAS_REMBG:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.cvtColor(np.array(rembg_remove(Image.fromarray(rgb))), cv2.COLOR_RGBA2BGRA)
+        else:
+            fh, fw = frame.shape[:2]
+            s_gc = min(1.0, 480.0 / max(fh, fw))
+            small = cv2.resize(frame, (max(1, int(fw * s_gc)), max(1, int(fh * s_gc))), interpolation=cv2.INTER_AREA)
+            sh, sw = small.shape[:2]
+            mask = np.zeros((sh, sw), np.uint8)
+            bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+            cv2.grabCut(small, mask, (int(sw * 0.1), int(sh * 0.1), int(sw * 0.8), int(sh * 0.8)), bgd, fgd, 2, cv2.GC_INIT_WITH_RECT)
+            alpha = np.where((mask == 2) | (mask == 0), 0, 255).astype("uint8")
+            alpha = cv2.GaussianBlur(cv2.resize(alpha, (fw, fh), interpolation=cv2.INTER_LINEAR), (0, 0), 1.5)
+            frame = cv2.merge([frame[:, :, 0], frame[:, :, 1], frame[:, :, 2], alpha])
+
+    if tf.ai_upscale:
+        frame = ai_super_res_upscale(frame, factor=2)
+        frame = cv2.resize(frame, (cw, ch), interpolation=cv2.INTER_AREA)
+
+    frame = apply_color(frame, seg.color)
+    comp_bgr, _ = apply_transform_pipeline(frame, tf, canvas_size=(cw, ch), for_preview_checkerboard=preview_mode)
+    if comp_bgr.ndim == 3 and comp_bgr.shape[2] == 4:
+        comp_bgr = comp_bgr[:, :, :3]
+    if seg.text.active():
+        comp_bgr = composite_bgra_over(comp_bgr, render_text_layer(cw, ch, seg.text))
+    if local_ms is not None and (seg.fade_in_ms > 0 or seg.fade_out_ms > 0):
+        k = 1.0
+        if seg.fade_in_ms > 0 and local_ms < seg.fade_in_ms:
+            k = min(k, local_ms / seg.fade_in_ms)
+        if seg.fade_out_ms > 0 and local_ms > seg.duration_ms - seg.fade_out_ms:
+            k = min(k, (seg.duration_ms - local_ms) / seg.fade_out_ms)
+        if k < 0.999:
+            comp_bgr = cv2.convertScaleAbs(comp_bgr, alpha=max(0.0, k))
+    return comp_bgr
+
+
+# --- The timeline compositor: clips + transitions + reframing + layers + subtitles ---
+class RenderContext:
+    """Everything needed to draw any moment of the timeline, safe to use from a worker thread (it holds copies)."""
+    def __init__(self, segments, overlays, subtitles, sub_style, burn_subs, out_w, out_h, fit_mode,
+                 preview=False, use_proxies=False):
+        self.segments = segments
+        self.overlays = overlays
+        self.subtitles = subtitles
+        self.sub_style = sub_style
+        self.burn_subs = burn_subs
+        self.out_w, self.out_h = out_w, out_h
+        self.fit_mode = fit_mode
+        self.preview = preview
+        self.use_proxies = use_proxies
+        self.starts = []
+        acc = 0
+        for s in segments:
+            self.starts.append(acc)
+            acc += s.duration_ms
+        self.total = acc
+        self._readers = OrderedDict()
+        self._clip_cache = {}
+
+    def reader(self, key, path, fps):
+        r = self._readers.get(key)
+        if r is None:
+            r = FrameReader(path, fps)
+            self._readers[key] = r
+            if len(self._readers) > 8:
+                _, old = self._readers.popitem(last=False)
+                old.release()
+        else:
+            self._readers.move_to_end(key)
+        return r
+
+    def release(self):
+        for r in self._readers.values():
+            r.release()
+        self._readers.clear()
+
+    def seg_index_at(self, t):
+        for i in range(len(self.segments)):
+            if t < self.starts[i] + self.segments[i].duration_ms or i == len(self.segments) - 1:
+                return i
+        return -1
+
+    def clip_frame(self, i, local_ms):
+        """Clip i at its own time, processed and fitted to the output size."""
+        seg = self.segments[i]
+        src = seg.source
+        local_ms = max(0.0, min(seg.duration_ms - 1, local_ms))
+        src_ms = min(seg.out_ms - 1, seg.in_ms + local_ms * seg.speed)
+        path = src.proxy_path if (self.use_proxies and getattr(src, "proxy_path", None)) else src.filepath
+        reader = self.reader((src.source_id, i), path, src.fps)
+        frame = reader.frame_at_ms(src_ms)
+        if frame is None:
+            return np.zeros((self.out_h, self.out_w, 3), np.uint8)
+        static = seg.fade_in_ms == 0 and seg.fade_out_ms == 0 and seg.motion.get("type", "none") == "none"
+        key = (i, reader.last_idx)
+        if static and key in self._clip_cache:
+            return self._clip_cache[key]
+        cw, ch = src.width or frame.shape[1], src.height or frame.shape[0]
+        scale = min(1.0, max(self.out_w, self.out_h) / max(cw, ch)) if self.preview else 1.0
+        processed = process_clip_frame(frame, seg, (cw, ch), preview_mode=False, scale=scale, local_ms=local_ms)
+        if self.fit_mode == "smart" and getattr(src, "face_track", None) is not None and not seg.crop_rect:
+            times, xs = src.face_track
+            cx = float(np.interp(src_ms, times, xs))
+            out = smart_crop(processed, self.out_w, self.out_h, cx)
+        else:
+            out = fit_into_frame(processed, self.out_w, self.out_h, "blur" if self.fit_mode == "smart" else self.fit_mode)
+        out = np.ascontiguousarray(out)
+        if static:
+            if len(self._clip_cache) > 6:
+                self._clip_cache.clear()
+            self._clip_cache[key] = out
+        return out
+
+    def frame_at(self, t_ms: float) -> np.ndarray:
+        if not self.segments:
+            return np.zeros((self.out_h, self.out_w, 3), np.uint8)
+        t_ms = max(0.0, min(self.total - 1, t_ms))
+        i = self.seg_index_at(t_ms)
+        seg = self.segments[i]
+        start, end = self.starts[i], self.starts[i] + seg.duration_ms
+        img = self.clip_frame(i, t_ms - start)
+        # Transition into this clip (from the previous one)
+        tr = seg.transition
+        if i > 0 and tr.get("type", "none") != "none":
+            d = max(80, tr.get("ms", 500))
+            if t_ms - start < d / 2:
+                prev_i = i - 1
+                prev = self.clip_frame(prev_i, t_ms - self.starts[prev_i])
+                img = blend_transition(prev, img, 0.5 + (t_ms - start) / d, tr["type"])
+        # Transition out of this clip (into the next one)
+        if i + 1 < len(self.segments):
+            ntr = self.segments[i + 1].transition
+            if ntr.get("type", "none") != "none":
+                d = max(80, ntr.get("ms", 500))
+                if end - t_ms < d / 2:
+                    nxt = self.clip_frame(i + 1, 0)
+                    img = blend_transition(img, nxt, 0.5 - (end - t_ms) / d, ntr["type"])
+        img = img.copy()
+        for k, ov in enumerate(self.overlays):
+            if not ov.active(t_ms):
+                continue
+            if ov.kind == "image":
+                src_img = ov.image_bgra()
+            else:
+                src_img = None
+                rd = self.reader(("ov", k), ov.path, 30.0)
+                fr = rd.frame_at_ms(t_ms - ov.start_ms)
+                if fr is not None:
+                    src_img = to_bgra(fr)
+            if src_img is None:
+                continue
+            sc = ov.scaled_for(src_img, self.out_w)
+            if ov.kind == "video":   # picture-in-picture gets a thin white frame
+                cv2.rectangle(sc, (0, 0), (sc.shape[1] - 1, sc.shape[0] - 1), (255, 255, 255, 255), max(2, sc.shape[1] // 120))
+            alpha_blit(img, sc, ov.cx * self.out_w, ov.cy * self.out_h, ov.opacity)
+        if self.burn_subs and self.subtitles:
+            cue = subtitle_at(self.subtitles, int(t_ms))
+            if cue:
+                st = self.sub_style.clone()
+                st.text = cue["text"]
+                img = composite_bgra_over(img, render_text_layer(self.out_w, self.out_h, st))
+        return img
+
+
+# --- Audio: clips + music with auto-ducking ---
+def build_timeline_audio(segments, music: "MusicTrack" = None, keep_pitch=True, sr=44100):
+    chunks = []
+    any_audio = False
+    for seg in segments:
+        src = seg.source
+        src.ensure_raw_audio()
+        target_len = max(1, int(round((seg.duration_ms / 1000.0) * sr)))
+        am = seg.audio_mix
+        s0 = int((seg.in_ms / 1000.0) * src.sample_rate)
+        s1 = int((seg.out_ms / 1000.0) * src.sample_rate)
+        mixed = None
+        if am.separated and src.stems_separated and src.voices_data is not None:
+            src_len = max(1, s1 - s0)
+            mixed = np.zeros((src_len, 2), dtype=np.float32)
+            for key, data, vol in (("voices", src.voices_data, am.voices_vol), ("music", src.music_data, am.music_vol),
+                                   ("noise", src.noise_data, am.noise_vol)):
+                if vol <= 0.0:
+                    continue
+                part = data[s0:s1] * vol
+                t_s = int((am.stem_trim_start.get(key, 0) * seg.speed / 1000.0) * src.sample_rate)
+                t_e = int((am.stem_trim_end.get(key, 0) * seg.speed / 1000.0) * src.sample_rate)
+                if t_s > 0:
+                    part[:min(len(part), t_s)] = 0.0
+                if t_e > 0:
+                    part[max(0, len(part) - t_e):] = 0.0
+                mixed[:len(part)] += part
+            any_audio = True
+        elif src.raw_audio is not None:
+            mixed = src.raw_audio[s0:s1].copy()
+            any_audio = True
+        if mixed is None or len(mixed) == 0:
+            chunks.append(np.zeros((target_len, 2), dtype=np.float32))
+            continue
+        if src.sample_rate != sr:
+            # Bring the clip to the mix's sample rate before any speed change
+            n_new = max(1, int(round(len(mixed) * sr / src.sample_rate)))
+            pos = np.linspace(0, len(mixed) - 1, n_new)
+            mixed = np.column_stack([np.interp(pos, np.arange(len(mixed)), mixed[:, c]) for c in range(2)]).astype(np.float32)
+        out = time_stretch(mixed, sr, seg.speed, target_len, keep_pitch=keep_pitch)
+        if abs(am.gain - 1.0) > 1e-3:
+            out = out * am.gain
+        fi = int(max(am.fade_in_ms, seg.fade_in_ms) * sr / 1000)
+        fo = int(max(am.fade_out_ms, seg.fade_out_ms) * sr / 1000)
+        if fi > 0:
+            fi = min(fi, len(out))
+            out[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)[:, None]
+        if fo > 0:
+            fo = min(fo, len(out))
+            out[len(out) - fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)[:, None]
+        chunks.append(np.clip(out, -1.0, 1.0))
+    if not chunks:
+        return None
+    clips = np.vstack(chunks).astype(np.float32)
+    total = len(clips)
+    if music and music.path:
+        m = music.audio()
+        if m is not None:
+            msr, maud = m
+            if msr != sr:
+                maud = time_stretch(maud, sr, 1.0, int(len(maud) * sr / msr), keep_pitch=False)
+            start = int(music.start_ms * sr / 1000)
+            need = max(0, total - start)
+            if need > 0 and len(maud):
+                if music.loop and len(maud) < need:
+                    maud = np.tile(maud, (need // len(maud) + 1, 1))
+                track = maud[:need] * music.volume
+                n = len(track)
+                fi, fo = min(n, int(music.fade_in_ms * sr / 1000)), min(n, int(music.fade_out_ms * sr / 1000))
+                if fi:
+                    track[:fi] *= np.linspace(0, 1, fi, dtype=np.float32)[:, None]
+                if fo:
+                    track[n - fo:] *= np.linspace(1, 0, fo, dtype=np.float32)[:, None]
+                if music.duck < 0.999 and any_audio:
+                    # Auto-ducking: lower the music wherever the clips have speech/sound
+                    ref = clips[start:start + n]
+                    win = int(sr * 0.05)
+                    nw = max(1, len(ref) // win)
+                    rms = np.sqrt((ref[:nw * win].reshape(nw, win, 2) ** 2).mean(axis=(1, 2)) + 1e-12)
+                    active = (20 * np.log10(rms) > -32).astype(np.float32)
+                    att, rel = 0.5, 0.12             # fast attack, slower release
+                    env = np.zeros_like(active)
+                    cur = 0.0
+                    for j, a in enumerate(active):
+                        cur = cur + (a - cur) * (att if a > cur else rel)
+                        env[j] = cur
+                    gain = 1.0 - (1.0 - music.duck) * np.repeat(env, win)
+                    gain = np.concatenate([gain, np.full(n - len(gain), gain[-1] if len(gain) else 1.0)])[:n]
+                    track *= gain[:, None]
+                clips[start:start + n] += track
+                any_audio = True
+    if not any_audio:
+        return None
+    return sr, np.clip(clips, -1.0, 1.0)
+
+
+# --- Photo layers ---
+class PhotoLayer:
+    def __init__(self, kind="image", name="Layer"):
+        self.kind = kind
+        self.name = name
+        self.bgra = None
+        self.cx, self.cy = 0.5, 0.5          # centre as a fraction of the canvas
+        self.width_frac = 0.35               # width as a fraction of the canvas width
+        self.opacity = 1.0
+        self.text = TextOverlay() if kind == "text" else None
+
+    def clone(self):
+        c = PhotoLayer(self.kind, self.name)
+        c.bgra = self.bgra
+        c.cx, c.cy, c.width_frac, c.opacity = self.cx, self.cy, self.width_frac, self.opacity
+        c.text = self.text.clone() if self.text else None
+        return c
+
+
+def render_text_image(ov: "TextOverlay", px: int = 160, accent: str = None) -> np.ndarray:
+    """Tight BGRA image of outlined text (for text layers and thumbnails)."""
+    font = QFont("Segoe UI", 10, QFont.Weight.Black)
+    font.setPixelSize(px)
+    fm = QFontMetrics(font)
+    lines = ov.text.split("\n")
+    w = max(fm.horizontalAdvance(ln) for ln in lines) + px
+    h = fm.height() * len(lines) + px // 2
+    img = QImage(w, h, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    if ov.backdrop:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRoundedRect(QRectF(0, 0, w, h), px * 0.2, px * 0.2)
+    for i, ln in enumerate(lines):
+        path = QPainterPath()
+        path.addText(QPointF((w - fm.horizontalAdvance(ln)) / 2, px / 4 + i * fm.height() + fm.ascent()), font, ln)
+        if ov.outline:
+            pen = QPen(QColor(accent or "#000000"), max(3.0, px * 0.12))
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.strokePath(path, pen)
+        p.fillPath(path, QColor(ov.color))
+    p.end()
+    ptr = img.constBits()
+    ptr.setsize(img.sizeInBytes())
+    return np.frombuffer(ptr, np.uint8).reshape(h, img.bytesPerLine() // 4, 4)[:, :w].copy()
+
+
+def composite_layers(bgr: np.ndarray, layers, alpha=None) -> np.ndarray:
+    H, W = bgr.shape[:2]
+    out = bgr.copy()
+    for ly in layers:
+        if ly.bgra is None:
+            continue
+        tw = max(4, int(W * ly.width_frac))
+        th = max(4, int(ly.bgra.shape[0] * tw / ly.bgra.shape[1]))
+        sc = cv2.resize(ly.bgra, (tw, th), interpolation=cv2.INTER_AREA if tw < ly.bgra.shape[1] else cv2.INTER_LINEAR)
+        alpha_blit(out, sc, ly.cx * W, ly.cy * H, ly.opacity, alpha)
+    return out
+
+
+# --- yt-dlp ---
+def ytdlp_command():
+    if has_module("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    if exe:
+        return [exe]
+    for cand in (os.path.join(APP_DIR, "yt-dlp.exe"), os.path.join(APP_DIR, "..", "downloader", "venv", "Scripts", "yt-dlp.exe")):
+        if os.path.isfile(cand):
+            return [cand]
+    return None
+
+
+
+# ==============================================================================
 # INTERACTIVE CANVAS (With Drag & Drop + Right-Click Context Menu Support)
 # ==============================================================================
 class PhotoCanvas(QLabel):
@@ -1120,7 +2086,7 @@ class PhotoCanvas(QLabel):
         if self._drag_hover:
             self.setStyleSheet("background-color: #10213d; border: 2px dashed #38BDF8; border-radius: 10px;")
         else:
-            self.setStyleSheet("background-color: #07090f; border: 1px solid #263248; border-radius: 10px;")
+            self.setStyleSheet(f"background-color: {THEME['canvas_bg']}; border: 1px solid {THEME['canvas_border']}; border-radius: 10px;")
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1193,7 +2159,7 @@ class PhotoCanvas(QLabel):
             painter.setOpacity(0.85)
             painter.drawPixmap((self.width() - 72) // 2, self.height() // 2 - 92, ic)
             painter.setOpacity(1.0)
-            painter.setPen(QColor("#8b9bb4"))
+            painter.setPen(QColor(THEME["canvas_text"]))
             painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
             painter.drawText(self.rect().adjusted(20, 10, -20, 0), Qt.AlignmentFlag.AlignCenter, self.placeholder_text)
             return
@@ -1363,6 +2329,10 @@ class VideoSource:
         self.noise_data = None
         self.envelopes = None
         self._audio_lock = threading.Lock()
+        self.proxy_path = None      # small edit-friendly copy for 4K sources (preview only)
+        self.face_track = None      # (times_ms, centre_x) for smart vertical reframing
+        self.thumbs = []            # [(source_ms, RGB thumbnail)] for the timeline
+        self.stems_engine = ""
 
     def ensure_raw_audio(self) -> bool:
         """Loads the clip's own soundtrack once (so un-separated clips keep their sound on export)."""
@@ -1450,6 +2420,8 @@ class TimelineSegment:
         text: TextOverlay = None,
         fade_in_ms: int = 0,
         fade_out_ms: int = 0,
+        transition: dict = None,
+        motion: dict = None,
     ):
         self.source = source
         self.in_ms = max(0, int(in_ms))
@@ -1462,6 +2434,8 @@ class TimelineSegment:
         self.text = text.clone() if text else TextOverlay()
         self.fade_in_ms = int(fade_in_ms)
         self.fade_out_ms = int(fade_out_ms)
+        self.transition = dict(transition) if transition else {"type": "none", "ms": 500}   # into this clip
+        self.motion = dict(motion) if motion else {"type": "none", "amount": 20}
         self._clamp_stem_trims()
 
     @property
@@ -1524,6 +2498,8 @@ class TimelineSegment:
             self.text,
             self.fade_in_ms,
             self.fade_out_ms,
+            self.transition,
+            self.motion,
         )
 
     def audio_key(self):
@@ -1550,7 +2526,7 @@ class TimelineWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(215)
+        self.setMinimumHeight(268)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.segments: list[TimelineSegment] = []
@@ -1561,6 +2537,10 @@ class TimelineWidget(QWidget):
         self.lock_tracks = True  # Locked by default so trimming video trims all audio stems with it
         self.lock_a = False      # Mark A / Mark B can be locked independently
         self.lock_b = False
+        self.overlays = []       # shown on their own lanes (set by the main window)
+        self.subtitles = []
+        self.music = None
+        self._thumb_px = {}      # (source_id, idx) -> QPixmap
 
         self._dragging_playhead = False
         self._dragging_mark = None   # "A" or "B" while a mark flag is dragged
@@ -1671,17 +2651,17 @@ class TimelineWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         bg = QLinearGradient(0, 0, 0, self.height())
-        bg.setColorAt(0, QColor("#0f141f"))
-        bg.setColorAt(1, QColor("#0a0d14"))
+        bg.setColorAt(0, QColor(THEME["tl_bg_top"]))
+        bg.setColorAt(1, QColor(THEME["tl_bg_bot"]))
         painter.fillRect(self.rect(), QBrush(bg))
 
         # 1. Draw Time Ruler
         ruler_h = 32
         rg = QLinearGradient(0, 0, 0, ruler_h)
-        rg.setColorAt(0, QColor("#2a3346"))
-        rg.setColorAt(1, QColor("#1a2132"))
+        rg.setColorAt(0, QColor(THEME["tl_ruler_top"]))
+        rg.setColorAt(1, QColor(THEME["tl_ruler_bot"]))
         painter.fillRect(0, 0, self.width(), ruler_h, QBrush(rg))
-        painter.setPen(QColor("#A1A1AA"))
+        painter.setPen(QColor(THEME["tl_text"]))
         painter.setFont(QFont("Consolas", 8))
 
         if self.px_per_sec >= 400:
@@ -1700,11 +2680,11 @@ class TimelineWidget(QWidget):
         for ms in range(int(first_ms), int(last_ms), minor_step_ms):
             x = self.ms_to_x(ms)
             if ms % major_step_ms == 0:
-                painter.setPen(QColor("#E4E4E7"))
+                painter.setPen(QColor(THEME["tl_major"]))
                 painter.drawLine(x, ruler_h - 12, x, ruler_h)
                 painter.drawText(x + 3, ruler_h - 14, format_ms(ms))
             else:
-                painter.setPen(QColor("#52525B"))
+                painter.setPen(QColor(THEME["tl_minor"]))
                 painter.drawLine(x, ruler_h - 6, x, ruler_h)
 
         if not self.segments:
@@ -1712,7 +2692,7 @@ class TimelineWidget(QWidget):
             painter.setOpacity(0.8)
             painter.drawPixmap(30, ruler_h + 60, ic)
             painter.setOpacity(1.0)
-            painter.setPen(QColor("#71717A"))
+            painter.setPen(QColor(THEME["tl_empty"]))
             painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             painter.drawText(
                 QRect(80, ruler_h, max(200, self.width() - 100), self.height() - ruler_h),
@@ -1738,6 +2718,42 @@ class TimelineWidget(QWidget):
             base_color = QColor(seg.source.color)
             vid_rect = QRect(x1, track_y, w, vid_h)
             self._glossy(painter, vid_rect, base_color, 6, base_color.lighter(160))
+            thumbs = seg.source.thumbs
+            if thumbs:
+                painter.save()
+                clip_path = QPainterPath()
+                clip_path.addRoundedRect(QRectF(vid_rect.adjusted(5, 3, -5, -3)), 4, 4)
+                painter.setClipPath(clip_path)
+                painter.setOpacity(0.55)
+                tw = max(24, int(thumbs[0][1].shape[1] * (vid_h - 6) / thumbs[0][1].shape[0]))
+                step_ms = max(1, thumbs[1][0] - thumbs[0][0]) if len(thumbs) > 1 else 1000
+                x = max(x1 + 5, vis.left() - tw)
+                while x < min(x2 - 5, vis.right() + tw):
+                    src_ms = seg.in_ms + (x - x1) / max(1, w) * seg.source_duration_ms
+                    k = max(0, min(len(thumbs) - 1, int(src_ms // step_ms)))
+                    key = (seg.source.source_id, k)
+                    pm = self._thumb_px.get(key)
+                    if pm is None:
+                        arr = thumbs[k][1]
+                        pm = QPixmap.fromImage(QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3,
+                                                      QImage.Format.Format_RGB888).copy())
+                        self._thumb_px[key] = pm
+                    painter.drawPixmap(QRect(x, track_y + 3, tw, vid_h - 6), pm)
+                    x += tw
+                painter.restore()
+                # Keep the label readable over the pictures
+                shade = QLinearGradient(QPointF(vid_rect.topLeft()), QPointF(vid_rect.bottomLeft()))
+                shade.setColorAt(0.0, QColor(0, 0, 0, 120))
+                shade.setColorAt(0.6, QColor(0, 0, 0, 20))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(shade))
+                painter.drawRoundedRect(vid_rect, 6, 6)
+            if seg.transition.get("type", "none") != "none" and cur_ms > 0:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 210))
+                hw = max(5, int(seg.transition.get("ms", 500) / 2000.0 * self.px_per_sec))
+                painter.drawPolygon([QPoint(x1 - hw, track_y + vid_h // 2), QPoint(x1, track_y + 4),
+                                     QPoint(x1 + hw, track_y + vid_h // 2), QPoint(x1, track_y + vid_h - 4)])
 
             # Video fades shown as shaded wedges
             painter.setPen(Qt.PenStyle.NoPen)
@@ -1777,8 +2793,8 @@ class TimelineWidget(QWidget):
                 full_s_rect = QRect(x1, sy, w, stem_h)
 
                 # Background slot (shows muted/trimmed area in dark red/gray)
-                painter.setBrush(QBrush(QColor("#27171A")))
-                painter.setPen(QPen(QColor("#3F3F46"), 1))
+                painter.setBrush(QBrush(QColor(THEME["tl_slot"])))
+                painter.setPen(QPen(QColor(THEME["tl_slot_border"]), 1))
                 painter.drawRoundedRect(full_s_rect, 3, 3)
 
                 # Active untrimmed portion of this stem
@@ -1825,6 +2841,31 @@ class TimelineWidget(QWidget):
                 painter.drawText(act_rect.adjusted(5, 2, -5, -2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, status_txt)
 
             cur_ms += seg.duration_ms
+
+        # Extra lanes: background music, layers (logo / PiP) and subtitles
+        lane_y = track_y + vid_h + 4 + 3 * (stem_h + 3) + 2
+        total = cur_ms
+        painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        lanes = []
+        if self.music is not None:
+            start = self.music.start_ms
+            aud = self.music._audio      # only use audio that is already loaded (never decode while painting)
+            end = total if (self.music.loop or aud is None) else min(total, start + int(len(aud[1]) * 1000 / max(1, aud[0])))
+            lanes.append(("MUSIC", [(start, end, self.music.name)], QColor("#ec4899")))
+        if self.overlays:
+            lanes.append(("LAYERS", [(o.start_ms, o.end_ms if o.end_ms is not None else total, o.name) for o in self.overlays], QColor("#22c55e")))
+        if self.subtitles:
+            lanes.append(("SUBS", [(c["start"], c["end"], c["text"].replace("\n", " ")) for c in self.subtitles], QColor("#a78bfa")))
+        for title, items, col in lanes:
+            painter.fillRect(QRect(20, lane_y, max(0, self.ms_to_x(total) - 20), 16), QColor(THEME["tl_lane"]))
+            for a, b, label in items:
+                ra = QRect(self.ms_to_x(a), lane_y + 1, max(3, self.ms_to_x(b) - self.ms_to_x(a)), 14)
+                if ra.right() < vis.left() or ra.left() > vis.right():
+                    continue
+                self._glossy(painter, ra, col, 3, col.lighter(140))
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(ra.adjusted(4, 0, -3, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{title}: {label}")
+            lane_y += 19
 
         # 3. Draw Mark A and Mark B Selection Region
         if self.mark_a_ms is not None and self.mark_b_ms is not None:
@@ -2009,14 +3050,70 @@ class TimelineWidget(QWidget):
 # ==============================================================================
 # MAIN WINDOW: ANK MEDIA STUDIO v2.0.0
 # ==============================================================================
-APP_STYLESHEET = """
-QMainWindow { background: #0b0f17; }
-QWidget { color: #E5E7EB; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 12px; }
+# ==============================================================================
+# THEMES — Dark, Light, or Auto (follows the computer's setting)
+# ==============================================================================
+THEMES = {
+    "dark": {
+        "win": "#0b0f17", "text": "#E5E7EB", "text_strong": "#F1F5F9", "muted": "#8b9bb4", "section": "#93c5fd",
+        "card_top": "#172033", "card_bot": "#0f1522", "card_border": "#24324d", "card_hi": "#33456a", "card_lo": "#05070d",
+        "btn_top": "#3a475e", "btn_mid": "#243045", "btn_bot": "#161e2e", "btn_border": "#3b4a63", "btn_hi": "#5b6b86",
+        "btn_h_top": "#4a5a76", "btn_h_mid": "#2e3c56", "btn_h_bot": "#1b2436", "btn_text": "#F1F5F9",
+        "btn_p_top": "#111827", "btn_p_bot": "#263248", "dis_text": "#4b5563", "dis_bg": "#121826", "dis_border": "#1f2937",
+        "tool_text": "#cbd5e1", "tool_hover": "rgba(255,255,255,0.07)", "tool_hover_border": "#334155",
+        "acc_top": "#2b3953", "acc_mid": "#1c2639", "acc_bot": "#121a29", "acc_border": "#2c3b57", "acc_hi": "#43567c", "acc_text": "#dbe4f3",
+        "page_top": "#131b2b", "page_bot": "#0c111b", "page_border": "#1f2a3d",
+        "pane": "#0d121c", "tab_top": "#2a3650", "tab_bot": "#141b2a", "tab_text": "#aab6cc",
+        "groove_top": "#02040a", "groove_bot": "#1f2937", "groove_border": "#0b0f17",
+        "field_top": "#05080f", "field_bot": "#111827", "field_border": "#334155", "field_text": "#f8fafc",
+        "popup": "#111827", "check_top": "#1e293b", "check_bot": "#0b1220", "check_border": "#475569",
+        "scroll_bg": "#0b0f17", "scroll_handle": "#334155", "status_bg": "#0a0e16", "status_text": "#94a3b8",
+        "status_border": "#1f2937", "menu_text": "#F4F4F5", "tip_text": "#e5e7eb",
+        "clock_bg": "#05080f", "clock_border": "#263248", "clock_text": "#FACC15", "alt_row": "#121a29",
+        "badge_bg": "#1f2937", "accent_text": "#FACC15", "info_text": "#22D3EE",
+        # custom-painted widgets
+        "tl_bg_top": "#0f141f", "tl_bg_bot": "#0a0d14", "tl_ruler_top": "#2a3346", "tl_ruler_bot": "#1a2132",
+        "tl_text": "#A1A1AA", "tl_major": "#E4E4E7", "tl_minor": "#52525B", "tl_empty": "#71717A",
+        "tl_slot": "#27171A", "tl_slot_border": "#3F3F46", "tl_lane": "#141a26",
+        "canvas_bg": "#07090f", "canvas_border": "#263248", "canvas_text": "#8b9bb4",
+    },
+    "light": {
+        "win": "#eef2f7", "text": "#0f172a", "text_strong": "#0f172a", "muted": "#526075", "section": "#1d4ed8",
+        "card_top": "#ffffff", "card_bot": "#eef2f8", "card_border": "#cdd6e3", "card_hi": "#ffffff", "card_lo": "#aeb9cb",
+        "btn_top": "#ffffff", "btn_mid": "#f1f5f9", "btn_bot": "#dfe6ef", "btn_border": "#c3cddb", "btn_hi": "#ffffff",
+        "btn_h_top": "#ffffff", "btn_h_mid": "#e8f0fe", "btn_h_bot": "#d4e2fb", "btn_text": "#0f172a",
+        "btn_p_top": "#cfd8e5", "btn_p_bot": "#eef2f7", "dis_text": "#9aa6b8", "dis_bg": "#eef1f5", "dis_border": "#d7dee8",
+        "tool_text": "#1e293b", "tool_hover": "rgba(37,99,235,0.08)", "tool_hover_border": "#b8c6db",
+        "acc_top": "#ffffff", "acc_mid": "#f2f5fa", "acc_bot": "#e3e9f2", "acc_border": "#c9d3e1", "acc_hi": "#ffffff", "acc_text": "#0f172a",
+        "page_top": "#ffffff", "page_bot": "#f5f7fb", "page_border": "#d5dde8",
+        "pane": "#f7f9fc", "tab_top": "#ffffff", "tab_bot": "#e4eaf2", "tab_text": "#334155",
+        "groove_top": "#c8d1de", "groove_bot": "#e6ebf2", "groove_border": "#b9c4d4",
+        "field_top": "#ffffff", "field_bot": "#f6f8fb", "field_border": "#c3cddb", "field_text": "#0f172a",
+        "popup": "#ffffff", "check_top": "#ffffff", "check_bot": "#e6ebf2", "check_border": "#94a3b8",
+        "scroll_bg": "#eef2f7", "scroll_handle": "#b9c4d4", "status_bg": "#ffffff", "status_text": "#475569",
+        "status_border": "#d5dde8", "menu_text": "#0f172a", "tip_text": "#0f172a",
+        "clock_bg": "#0f172a", "clock_border": "#334155", "clock_text": "#FACC15", "alt_row": "#f3f6fa",
+        "badge_bg": "#dfe6ef", "accent_text": "#b45309", "info_text": "#0e7490",
+        "tl_bg_top": "#f4f7fb", "tl_bg_bot": "#e7edf5", "tl_ruler_top": "#ffffff", "tl_ruler_bot": "#dce4ee",
+        "tl_text": "#475569", "tl_major": "#0f172a", "tl_minor": "#94a3b8", "tl_empty": "#64748b",
+        "tl_slot": "#f1dede", "tl_slot_border": "#cbd5e1", "tl_lane": "#e9eef5",
+        "canvas_bg": "#0b0f17", "canvas_border": "#b9c4d4", "canvas_text": "#9fb0c7",
+    },
+}
+THEME = dict(THEMES["dark"])   # active colours (custom-painted widgets read from here)
+
+STYLESHEET_TEMPLATE = """
+QMainWindow { background: $win; }
+QWidget { color: $text; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 12px; }
+QDialog { background: $win; }
 QFrame#Header {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1e3a8a, stop:0.55 #4c1d95, stop:1 #111827);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1e3a8a, stop:0.55 #4c1d95, stop:1 #0f172a);
     border: 1px solid #3b4a7a; border-top-color: #6d83c9; border-bottom-color: #05070d; border-radius: 14px;
 }
 QFrame#Header QLabel { background: transparent; }
+QFrame#Header QToolButton { color: #e2e8f0; }
+QFrame#Header QToolButton:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.25); }
+QFrame#Header QComboBox { background: rgba(0,0,0,0.25); color: white; border: 1px solid rgba(255,255,255,0.3); }
 QLabel#AppTitle { color: #ffffff; font-size: 20px; font-weight: 800; }
 QLabel#AppSub { color: #c7d2fe; font-size: 11px; }
 QLabel#Chip {
@@ -2024,32 +3121,32 @@ QLabel#Chip {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #34d399, stop:1 #047857); border: 1px solid #6ee7b7;
 }
 QFrame#Card, QFrame#Transport {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #172033, stop:1 #0f1522);
-    border: 1px solid #24324d; border-top-color: #33456a; border-bottom-color: #05070d; border-radius: 12px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $card_top, stop:1 $card_bot);
+    border: 1px solid $card_border; border-top-color: $card_hi; border-bottom-color: $card_lo; border-radius: 12px;
 }
 QPushButton {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3a475e, stop:0.5 #243045, stop:1 #161e2e);
-    border: 1px solid #3b4a63; border-top-color: #5b6b86; border-bottom-color: #05070d;
-    border-radius: 8px; padding: 6px 10px; font-weight: 600; color: #F1F5F9;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $btn_top, stop:0.5 $btn_mid, stop:1 $btn_bot);
+    border: 1px solid $btn_border; border-top-color: $btn_hi; border-bottom-color: $card_lo;
+    border-radius: 8px; padding: 6px 10px; font-weight: 600; color: $btn_text;
 }
-QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4a5a76, stop:0.5 #2e3c56, stop:1 #1b2436); border-color: #60A5FA; }
-QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #111827, stop:1 #263248); padding-top: 7px; padding-bottom: 5px; }
+QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $btn_h_top, stop:0.5 $btn_h_mid, stop:1 $btn_h_bot); border-color: #60A5FA; }
+QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $btn_p_top, stop:1 $btn_p_bot); padding-top: 7px; padding-bottom: 5px; }
 QPushButton:checked { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #60a5fa, stop:0.5 #2563eb, stop:1 #1e40af); border-color: #93c5fd; color: white; }
-QPushButton:disabled { color: #4b5563; background: #121826; border-color: #1f2937; }
+QPushButton:disabled { color: $dis_text; background: $dis_bg; border-color: $dis_border; }
 QPushButton[kind="primary"] { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #60a5fa, stop:0.5 #2563eb, stop:1 #1e3a8a); border-color: #93c5fd; color: white; }
 QPushButton[kind="success"] { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #34d399, stop:0.5 #059669, stop:1 #064e3b); border-color: #6ee7b7; color: white; }
 QPushButton[kind="danger"]  { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fb7185, stop:0.5 #e11d48, stop:1 #881337); border-color: #fda4af; color: white; }
 QPushButton[kind="warn"]    { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fbbf24, stop:0.5 #d97706, stop:1 #78350f); border-color: #fcd34d; color: white; }
 QPushButton[kind="accent"]  { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #a78bfa, stop:0.5 #7c3aed, stop:1 #4c1d95); border-color: #c4b5fd; color: white; }
 QPushButton[kind]:hover { border-color: #ffffff; }
-QToolButton { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px; color: #cbd5e1; font-weight: 600; }
-QToolButton:hover { background: rgba(255,255,255,0.07); border-color: #334155; }
-QToolButton:pressed { background: rgba(0,0,0,0.25); }
-QToolButton:checked { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(96,165,250,0.45), stop:1 rgba(30,64,175,0.35)); border-color: #60a5fa; color: white; }
+QToolButton { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 4px; color: $tool_text; font-weight: 600; }
+QToolButton:hover { background: $tool_hover; border-color: $tool_hover_border; }
+QToolButton:pressed { background: rgba(0,0,0,0.18); }
+QToolButton:checked { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(96,165,250,0.45), stop:1 rgba(30,64,175,0.35)); border-color: #60a5fa; }
 QPushButton#AccHeader {
-    text-align: left; padding: 7px 12px; font-weight: 700; color: #dbe4f3; border-radius: 9px;
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2b3953, stop:0.5 #1c2639, stop:1 #121a29);
-    border: 1px solid #2c3b57; border-top-color: #43567c; border-bottom-color: #05070d;
+    text-align: left; padding: 7px 12px; font-weight: 700; color: $acc_text; border-radius: 9px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $acc_top, stop:0.5 $acc_mid, stop:1 $acc_bot);
+    border: 1px solid $acc_border; border-top-color: $acc_hi; border-bottom-color: $card_lo;
 }
 QPushButton#AccHeader:hover { border-color: #60a5fa; }
 QPushButton#AccHeader:checked {
@@ -2057,54 +3154,98 @@ QPushButton#AccHeader:checked {
     border-color: #93c5fd; color: white;
 }
 QWidget#ToolPage {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #131b2b, stop:1 #0c111b);
-    border: 1px solid #1f2a3d; border-radius: 10px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $page_top, stop:1 $page_bot);
+    border: 1px solid $page_border; border-radius: 10px;
 }
 QWidget#ToolPage QLabel { background: transparent; }
-QGroupBox { border: 1px solid #24324d; border-radius: 9px; margin-top: 10px; padding: 8px 6px 6px 6px; font-weight: 700; background: #0f1522; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #38BDF8; }
-QTabWidget::pane { border: 1px solid #1f2a3d; border-radius: 12px; top: -1px; background: #0d121c; }
+QGroupBox { border: 1px solid $card_border; border-radius: 9px; margin-top: 10px; padding: 8px 6px 6px 6px; font-weight: 700; background: $page_bot; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: $section; }
+QTabWidget::pane { border: 1px solid $page_border; border-radius: 12px; top: -1px; background: $pane; }
 QTabBar::tab {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a3650, stop:1 #141b2a);
-    border: 1px solid #2c3b57; border-bottom: none; border-top-left-radius: 10px; border-top-right-radius: 10px;
-    padding: 9px 22px; margin-right: 4px; font-weight: 700; color: #aab6cc;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $tab_top, stop:1 $tab_bot);
+    border: 1px solid $acc_border; border-bottom: none; border-top-left-radius: 10px; border-top-right-radius: 10px;
+    padding: 9px 22px; margin-right: 4px; font-weight: 700; color: $tab_text;
 }
 QTabBar::tab:selected { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5b9bff, stop:0.5 #2563eb, stop:1 #1d4ed8); color: white; border-color: #93c5fd; }
-QTabBar::tab:hover:!selected { color: #ffffff; border-color: #60a5fa; }
-QSlider::groove:horizontal { height: 6px; background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #02040a, stop:1 #1f2937); border-radius: 3px; border: 1px solid #0b0f17; }
+QTabBar::tab:hover:!selected { border-color: #60a5fa; }
+QSlider::groove:horizontal { height: 6px; background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $groove_top, stop:1 $groove_bot); border-radius: 3px; border: 1px solid $groove_border; }
 QSlider::sub-page:horizontal { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:1 #38bdf8); border-radius: 3px; }
 QSlider::handle:horizontal {
     background: qradialgradient(cx:0.35, cy:0.3, radius:0.9, fx:0.35, fy:0.3, stop:0 #ffffff, stop:0.35 #bfdbfe, stop:1 #1d4ed8);
     width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; border: 1px solid #0b1220;
 }
-QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #05080f, stop:1 #111827);
-    border: 1px solid #334155; border-radius: 7px; padding: 4px 7px; color: #f8fafc; selection-background-color: #2563eb;
+QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QPlainTextEdit, QTextEdit {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $field_top, stop:1 $field_bot);
+    border: 1px solid $field_border; border-radius: 7px; padding: 4px 7px; color: $field_text; selection-background-color: #2563eb; selection-color: white;
 }
 QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: #3b82f6; }
-QComboBox QAbstractItemView { background: #111827; border: 1px solid #3b82f6; selection-background-color: #2563eb; }
+QComboBox QAbstractItemView { background: $popup; color: $field_text; border: 1px solid #3b82f6; selection-background-color: #2563eb; }
+QListWidget, QTableWidget {
+    background: $field_bot; alternate-background-color: $alt_row; border: 1px solid $field_border; border-radius: 8px;
+    color: $field_text; selection-background-color: #2563eb; selection-color: white; gridline-color: $page_border;
+}
+QHeaderView::section { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $acc_top, stop:1 $acc_bot); color: $acc_text;
+    border: none; border-right: 1px solid $page_border; padding: 5px; font-weight: 700; }
+QProgressBar { background: $field_bot; border: 1px solid $field_border; border-radius: 7px; text-align: center; color: $text; height: 16px; }
+QProgressBar::chunk { border-radius: 6px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #34d399); }
 QCheckBox { spacing: 7px; }
-QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid #475569;
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1e293b, stop:1 #0b1220); }
+QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid $check_border;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $check_top, stop:1 $check_bot); }
 QCheckBox::indicator:checked { border-color: #93c5fd;
     background: qradialgradient(cx:0.35, cy:0.3, radius:1.0, fx:0.35, fy:0.3, stop:0 #bfdbfe, stop:0.45 #3b82f6, stop:1 #1e3a8a); }
 QScrollArea { border: none; background: transparent; }
-QScrollBar:vertical { background: #0b0f17; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #334155; border-radius: 5px; min-height: 30px; }
-QScrollBar:horizontal { background: #0b0f17; height: 10px; margin: 0; }
-QScrollBar::handle:horizontal { background: #334155; border-radius: 5px; min-width: 30px; }
+QScrollBar:vertical { background: $scroll_bg; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: $scroll_handle; border-radius: 5px; min-height: 30px; }
+QScrollBar:horizontal { background: $scroll_bg; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: $scroll_handle; border-radius: 5px; min-width: 30px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-QStatusBar { background: #0a0e16; color: #94a3b8; border-top: 1px solid #1f2937; }
-QMenu { background-color: #111827; color: #F4F4F5; border: 1px solid #3b82f6; padding: 4px; border-radius: 8px; }
+QStatusBar { background: $status_bg; color: $status_text; border-top: 1px solid $status_border; }
+QMenu { background-color: $popup; color: $menu_text; border: 1px solid #3b82f6; padding: 4px; border-radius: 8px; }
 QMenu::item { padding: 6px 22px 6px 26px; border-radius: 5px; }
 QMenu::item:selected { background-color: #2563EB; color: white; }
-QMenu::separator { height: 1px; background: #334155; margin: 4px 6px; }
-QToolTip { background: #111827; color: #e5e7eb; border: 1px solid #3b82f6; padding: 5px; border-radius: 6px; }
-QLabel#Section { color: #93c5fd; font-weight: 700; padding-top: 4px; }
-QLabel#Muted { color: #8b9bb4; }
-QLabel#Clock { color: #FACC15; font-family: Consolas, monospace; font-size: 17px; font-weight: 800;
-    background: #05080f; padding: 5px 12px; border-radius: 8px; border: 1px solid #263248; }
+QMenu::separator { height: 1px; background: $page_border; margin: 4px 6px; }
+QToolTip { background: $popup; color: $tip_text; border: 1px solid #3b82f6; padding: 5px; border-radius: 6px; }
+QLabel#Section { color: $section; font-weight: 700; padding-top: 4px; }
+QLabel#Muted { color: $muted; }
+QLabel#Accent { color: $accent_text; font-weight: bold; }
+QLabel#Info { color: $info_text; font-family: Consolas, monospace; }
+QLabel#Badge { padding: 5px 10px; border-radius: 7px; background: $badge_bg; }
+QCheckBox#Strong { color: $section; font-weight: bold; }
+QLabel#Clock { color: $clock_text; font-family: Consolas, monospace; font-size: 17px; font-weight: 800;
+    background: $clock_bg; padding: 5px 12px; border-radius: 8px; border: 1px solid $clock_border; }
 """
+
+
+def system_prefers_dark() -> bool:
+    """Reads the computer's light/dark setting (Qt 6.5+, with a Windows registry fallback)."""
+    try:
+        hints = QApplication.styleHints()
+        scheme = hints.colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return True
+        if scheme == Qt.ColorScheme.Light:
+            return False
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            pass
+    return True
+
+
+def resolve_theme(choice: str) -> str:
+    return ("dark" if system_prefers_dark() else "light") if choice == "auto" else choice
+
+
+def build_stylesheet(name: str) -> str:
+    from string import Template
+    THEME.clear()
+    THEME.update(THEMES[name])
+    return Template(STYLESHEET_TEMPLATE).substitute(THEME)
 
 
 class _UiBridge(QObject):
@@ -2166,7 +3307,9 @@ class ANKMediaStudio(QMainWindow):
         self.setWindowIcon(make_icon("logo", "violet"))
         self.resize(1560, 980)
         self.setAcceptDrops(True)
-        self.setStyleSheet(APP_STYLESHEET)
+        self.settings = QSettings("ANK", "MediaStudio")
+        self.theme_choice = str(self.settings.value("theme", "auto"))
+        self.setStyleSheet(build_stylesheet(resolve_theme(self.theme_choice)))
 
         self._bridge = _UiBridge()
         self._bridge.call.connect(lambda fn: fn())
@@ -2179,6 +3322,7 @@ class ANKMediaStudio(QMainWindow):
         self.photo_transform = TransformParams()
         self.photo_color = ColorParams()
         self.photo_text = TextOverlay()
+        self.photo_layers: list[PhotoLayer] = []
         self.photo_path = ""
         self.photo_undo_stack = []
         self.photo_redo_stack = []
@@ -2205,9 +3349,25 @@ class ANKMediaStudio(QMainWindow):
         self._audio_cache = (None, None, None)   # (key, sr, float audio)
 
         self.export_settings = {"format": 0, "fit": 0, "fps": 0, "quality": 1, "keep_pitch": True}
+        self.overlays: list[OverlayItem] = []
+        self.music: MusicTrack = None
+        self.subtitles: list[dict] = []
+        self.export_jobs = []
+        self._export_worker_busy = False
+        self.project_path = ""
+        self._dirty = False
 
         self._build_ui()
         self._setup_shortcuts()
+        self.timeline.overlays, self.timeline.subtitles, self.timeline.music = self.overlays, self.subtitles, None
+        self._detect_encoders_async()
+        self._rebuild_recent_menu()
+        self._update_title()
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(60_000)
+        self._autosave_timer.timeout.connect(self._autosave)
+        self._autosave_timer.start()
+        QTimer.singleShot(600, self._offer_recovery)
 
     # ==========================================================================
     # KEYBOARD SHORTCUTS (paused while typing in a text/number box)
@@ -2241,10 +3401,38 @@ class ANKMediaStudio(QMainWindow):
         sc(Qt.Key.Key_Home, video_only(lambda: self._seek_absolute(0)))
         sc(Qt.Key.Key_End, video_only(lambda: self._seek_absolute(self.timeline.total_duration_ms())))
         sc("Ctrl+O", self._header_open)
-        sc("Ctrl+S", self._header_export)
+        sc("Ctrl+S", self._save_shortcut)
+        sc("Ctrl+Shift+S", lambda: self._save_project(save_as=True))
+        sc("Ctrl+N", self._new_project)
+        sc("Ctrl+Shift+O", lambda: self._open_project())
         sc("Ctrl+E", self._header_export)
 
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
+        try:
+            QApplication.styleHints().colorSchemeChanged.connect(self._on_system_scheme_changed)
+        except Exception:
+            pass
+
+    def _set_theme(self, choice: str):
+        self.theme_choice = choice
+        self.cmb_theme.blockSignals(True)
+        self.cmb_theme.setCurrentIndex({"auto": 0, "dark": 1, "light": 2}.get(choice, 0))
+        self.cmb_theme.blockSignals(False)
+        self.settings.setValue("theme", choice)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        name = resolve_theme(self.theme_choice)
+        self.setStyleSheet(build_stylesheet(name))
+        for canvas in (self.video_Canvas, self.photo_canvas):
+            canvas._update_border_style()
+            canvas.update()
+        self.timeline.update()
+        self.status.showMessage(f"Theme: {name.title()}" + (" (following your computer)" if self.theme_choice == "auto" else ""))
+
+    def _on_system_scheme_changed(self, *_):
+        if self.theme_choice == "auto":
+            self._apply_theme()
 
     def _on_focus_changed(self, _old, new):
         typing = isinstance(new, (QLineEdit, QAbstractSpinBox)) or (isinstance(new, QComboBox) and new.isEditable())
@@ -2260,28 +3448,30 @@ class ANKMediaStudio(QMainWindow):
             self._toggle_playback()
 
     def _shortcut_undo(self):
-        if self.tabs.currentIndex() == 0:
-            self._undo_video()
-        else:
+        if self.tabs.currentIndex() == 1:
             self._undo_photo()
+        else:
+            self._undo_video()
 
     def _shortcut_redo(self):
-        if self.tabs.currentIndex() == 0:
-            self._redo_video()
-        else:
+        if self.tabs.currentIndex() == 1:
             self._redo_photo()
+        else:
+            self._redo_video()
 
     def _header_open(self):
-        if self.tabs.currentIndex() == 0:
-            self._add_videos(insert_at_playhead=False)
-        else:
+        if self.tabs.currentIndex() == 1:
             self._open_photo()
+        else:
+            self.tabs.setCurrentIndex(0)
+            self._add_videos(insert_at_playhead=False)
 
     def _header_export(self):
-        if self.tabs.currentIndex() == 0:
-            self._export_timeline_video()
-        else:
+        if self.tabs.currentIndex() == 1:
             self._save_photo(transparent_png=False)
+        else:
+            self.tabs.setCurrentIndex(0)
+            self._export_timeline_video()
 
     def _header_copy(self):
         if self.tabs.currentIndex() == 0:
@@ -2302,6 +3492,10 @@ class ANKMediaStudio(QMainWindow):
         event.acceptProposedAction()
 
     def _route_dropped_files(self, paths: list[str], insert_at_ms: int = None):
+        projects = [p for p in paths if p.lower().endswith(".ank")]
+        if projects:
+            self._open_project(projects[0])
+            return
         photo_files = [p for p in paths if os.path.splitext(p)[1].lower() in PHOTO_EXTS]
         video_files = [p for p in paths if os.path.splitext(p)[1].lower() in VIDEO_EXTS]
 
@@ -2393,7 +3587,7 @@ class ANKMediaStudio(QMainWindow):
         title_box.setSpacing(0)
         title_lbl = QLabel(APP_NAME)
         title_lbl.setObjectName("AppTitle")
-        sub_lbl = QLabel(f"Created by {APP_AUTHOR}  •  Video • Audio Stems • Photo • AI")
+        sub_lbl = QLabel(f"Created by {APP_AUTHOR}  •  Video • AI Subtitles • Audio Stems • Photo • Download")
         sub_lbl.setObjectName("AppSub")
         title_box.addWidget(title_lbl)
         title_box.addWidget(sub_lbl)
@@ -2404,6 +3598,27 @@ class ANKMediaStudio(QMainWindow):
         hl.addSpacing(8)
         hl.addWidget(chip, 0, Qt.AlignmentFlag.AlignTop)
         hl.addStretch()
+        theme_lbl = QLabel("Theme")
+        theme_lbl.setStyleSheet("color: #c7d2fe; font-weight: 700;")
+        self.cmb_theme = QComboBox()
+        self.cmb_theme.addItems(["Auto (follow computer)", "Dark", "Light"])
+        self.cmb_theme.setCurrentIndex({"auto": 0, "dark": 1, "light": 2}.get(self.theme_choice, 0))
+        self.cmb_theme.setToolTip("Auto follows your computer's dark / light setting")
+        self.cmb_theme.currentIndexChanged.connect(lambda i: self._set_theme(("auto", "dark", "light")[i]))
+        hl.addWidget(theme_lbl)
+        hl.addWidget(self.cmb_theme)
+        hl.addSpacing(10)
+        proj_btn = tool_button("Project", "save", "violet", "New, open and save projects (.ank) — autosaved every minute", size=30)
+        proj_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        pm = QMenu(proj_btn)
+        pm.addAction(make_icon("add", "green"), "New Project\tCtrl+N", self._new_project)
+        pm.addAction(make_icon("open", "amber"), "Open Project…\tCtrl+Shift+O", lambda: self._open_project())
+        pm.addAction(make_icon("save", "blue"), "Save Project\tCtrl+S", self._save_project)
+        pm.addAction(make_icon("save", "violet"), "Save Project As…\tCtrl+Shift+S", lambda: self._save_project(save_as=True))
+        pm.addSeparator()
+        self.menu_recent = pm.addMenu(make_icon("film", "slate"), "Recent Projects")
+        proj_btn.setMenu(pm)
+        hl.addWidget(proj_btn)
         for text, icon, color, tip, fn in (
             ("Open", "open", "amber", "Open video(s) or a photo (Ctrl+O)", self._header_open),
             ("Undo", "undo", "slate", "Undo (Ctrl+Z)", self._shortcut_undo),
@@ -2422,6 +3637,7 @@ class ANKMediaStudio(QMainWindow):
         self.tabs.setIconSize(QSize(22, 22))
         self.tabs.addTab(self._build_video_tab(), make_icon("film", "blue"), "Video && Audio Stem Studio")
         self.tabs.addTab(self._build_photo_tab(), make_icon("image", "pink"), "Photo, Retouch && AI Studio")
+        self.tabs.addTab(self._build_download_tab(), make_icon("export", "green"), "Download")
         self.tabs.currentChanged.connect(lambda _: self.is_playing and self._toggle_playback())
         main_layout.addWidget(self.tabs, 1)
 
@@ -2489,6 +3705,10 @@ class ANKMediaStudio(QMainWindow):
         self.chk_loop = QCheckBox("Loop A-B")
         self.chk_loop.setToolTip("Loop playback between Mark A and Mark B")
         tl.addWidget(self.chk_loop)
+        self.chk_output_view = QCheckBox("Final output")
+        self.chk_output_view.setToolTip("Preview exactly what will be exported: framing, transitions, layers and subtitles")
+        self.chk_output_view.toggled.connect(self._on_output_view_toggled)
+        tl.addWidget(self.chk_output_view)
         tl.addStretch()
         for icon, tip, fn in (
             ("camera", "Save the current frame as PNG", self._snapshot_frame),
@@ -2502,7 +3722,7 @@ class ANKMediaStudio(QMainWindow):
         info_bar = QHBoxLayout()
         self.lbl_active_clip_badge = QLabel("Active Clip: None")
         self.lbl_active_clip_badge.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.lbl_active_clip_badge.setStyleSheet("padding: 5px 10px; border-radius: 7px; background: #1f2937;")
+        self.lbl_active_clip_badge.setObjectName("Badge")
         info_bar.addWidget(self.lbl_active_clip_badge, 1)
         monitor_box.addLayout(info_bar)
 
@@ -2539,7 +3759,7 @@ class ANKMediaStudio(QMainWindow):
 
         lay.addWidget(self._section("Selection  (Mark A → Mark B)"))
         self.lbl_marks_info = QLabel("Mark A: --:--.---   |   Mark B: --:--.---")
-        self.lbl_marks_info.setStyleSheet("color: #22D3EE; font-family: Consolas;")
+        self.lbl_marks_info.setObjectName("Info")
         lay.addWidget(self.lbl_marks_info)
         btn_set_a = icon_button("Mark A ([)", "marker", "cyan")
         btn_set_a.clicked.connect(self._set_mark_a)
@@ -2569,7 +3789,7 @@ class ANKMediaStudio(QMainWindow):
         lay = self._toolbox_page(inspector, "Trim Start / End (Locked or Single Stem)", "split", "orange")
         self.chk_lock_tracks = QCheckBox("Lock video and all audio stems together when trimming")
         self.chk_lock_tracks.setChecked(True)
-        self.chk_lock_tracks.setStyleSheet("color: #38BDF8; font-weight: bold;")
+        self.chk_lock_tracks.setObjectName("Strong")
         self.chk_lock_tracks.toggled.connect(self._on_lock_tracks_toggled)
         lay.addWidget(self.chk_lock_tracks)
         self.cmb_trim_target = QComboBox()
@@ -2604,7 +3824,16 @@ class ANKMediaStudio(QMainWindow):
         lay = self._toolbox_page(inspector, "Audio Mixer & Stem Separator", "mic", "sky")
         self.btn_sep_audio = icon_button("Separate Audio into Voices, Music & Noises", "mic", "sky", kind="primary")
         self.btn_sep_audio.clicked.connect(self._separate_audio_for_active_clip)
+        self.cmb_sep_engine = QComboBox()
+        self.cmb_sep_engine.addItem("Fast — frequency filter (instant)", "fast")
+        self.cmb_sep_engine.addItem("AI — Demucs (clean vocals, slower)" if demucs_available() else
+                                    "AI — Demucs (not installed: pip install demucs)", "demucs")
+        if demucs_available():
+            self.cmb_sep_engine.setCurrentIndex(1)
+        else:
+            self.cmb_sep_engine.model().item(1).setEnabled(False)
         lay.addWidget(self.btn_sep_audio)
+        lay.addLayout(self._row(QLabel("Engine:"), self.cmb_sep_engine, stretch_last=True))
         self.lbl_sep_progress = self._muted("Stems: not separated yet for the active clip.")
         lay.addWidget(self.lbl_sep_progress)
 
@@ -2775,7 +4004,7 @@ class ANKMediaStudio(QMainWindow):
         # --- 7. Speed ---
         lay = self._toolbox_page(inspector, "Speed — Slow-Mo & Fast-Forward", "speed", "violet")
         self.lbl_speed_val = QLabel("Target Speed: 1.00x (Normal)")
-        self.lbl_speed_val.setStyleSheet("color: #FACC15; font-weight: bold;")
+        self.lbl_speed_val.setObjectName("Accent")
         self.sl_speed = QSlider(Qt.Orientation.Horizontal)
         self.sl_speed.setRange(10, 800)
         self.sl_speed.setValue(100)
@@ -2797,33 +4026,224 @@ class ANKMediaStudio(QMainWindow):
         lay.addWidget(self._muted("Exports keep voices at their natural pitch when the speed changes (needs FFmpeg)."))
         lay.addStretch()
 
-        # --- 8. Export ---
-        lay = self._toolbox_page(inspector, "Export Video", "export", "green")
+        # --- 8. Transitions & Motion ---
+        lay = self._toolbox_page(inspector, "Transitions & Motion (Ken Burns)", "layers", "cyan")
+        lay.addWidget(self._section("Transition into the active clip"))
+        self.cmb_transition = QComboBox()
+        for key, title in TRANSITION_TYPES:
+            self.cmb_transition.addItem(title, key)
+        self.spn_transition = QDoubleSpinBox()
+        self.spn_transition.setRange(0.1, 3.0)
+        self.spn_transition.setSingleStep(0.1)
+        self.spn_transition.setValue(0.6)
+        self.spn_transition.setSuffix(" s")
+        lay.addLayout(self._row(self.cmb_transition, self.spn_transition, stretch_last=False))
+        btn_tr = icon_button("Apply to This Cut", "layers", "cyan", kind="primary")
+        btn_tr.clicked.connect(lambda: self._apply_transition(all_cuts=False))
+        btn_tr_all = icon_button("Apply to All Cuts", "layers", "violet", kind="accent")
+        btn_tr_all.clicked.connect(lambda: self._apply_transition(all_cuts=True))
+        lay.addLayout(self._row(btn_tr, btn_tr_all))
+        lay.addWidget(self._section("Motion over the active clip"))
+        self.cmb_motion = QComboBox()
+        for key, title in MOTION_TYPES:
+            self.cmb_motion.addItem(title, key)
+        self.spn_motion = QSpinBox()
+        self.spn_motion.setRange(5, 60)
+        self.spn_motion.setValue(20)
+        self.spn_motion.setSuffix(" % strength")
+        btn_mo = icon_button("Apply Motion", "zoom_in", "teal")
+        btn_mo.clicked.connect(self._apply_motion)
+        lay.addLayout(self._row(self.cmb_motion, self.spn_motion, btn_mo))
+        lay.addWidget(self._muted("Slow zooms and pans bring still shots and photos to life. Transitions show in "
+                                  "'Final output' view and in exports."))
+        lay.addStretch()
+
+        # --- 9. Layers & Music ---
+        lay = self._toolbox_page(inspector, "Layers (Logo, PiP) & Background Music", "image", "green")
+        btn_ov_img = icon_button("Add Logo / Image", "image", "green", kind="primary")
+        btn_ov_img.clicked.connect(lambda: self._add_overlay("image"))
+        btn_ov_vid = icon_button("Add Picture-in-Picture", "film", "blue")
+        btn_ov_vid.clicked.connect(lambda: self._add_overlay("video"))
+        lay.addLayout(self._row(btn_ov_img, btn_ov_vid))
+        self.lst_overlays = QListWidget()
+        self.lst_overlays.setMaximumHeight(92)
+        self.lst_overlays.currentRowChanged.connect(self._on_overlay_selected)
+        lay.addWidget(self.lst_overlays)
+        self.cmb_ov_pos = QComboBox()
+        self.cmb_ov_pos.addItems(list(OverlayItem.POSITIONS.keys()))
+        self.cmb_ov_pos.setCurrentText("Top Right")
+        self.cmb_ov_pos.currentIndexChanged.connect(self._on_overlay_changed)
+        lay.addLayout(self._row(QLabel("Position"), self.cmb_ov_pos, stretch_last=True))
+        self.sl_ov_size = self._labeled_slider(lay, "Size", 5, 80, 22, lambda _v: self._on_overlay_changed(), "% width")
+        self.sl_ov_opacity = self._labeled_slider(lay, "Opacity", 10, 100, 100, lambda _v: self._on_overlay_changed(), "%")
+        btn_ov_marks = icon_button("Show Only in [A-B]", "ab", "indigo")
+        btn_ov_marks.clicked.connect(lambda: self._set_overlay_range(use_marks=True))
+        btn_ov_all = icon_button("Whole Video", "film", "slate")
+        btn_ov_all.clicked.connect(lambda: self._set_overlay_range(use_marks=False))
+        btn_ov_del = icon_button("Remove", "trash", "red")
+        btn_ov_del.clicked.connect(self._remove_overlay)
+        lay.addLayout(self._row(btn_ov_marks, btn_ov_all, btn_ov_del))
+
+        lay.addWidget(self._section("Background music"))
+        self.lbl_music = self._muted("No music track.")
+        lay.addWidget(self.lbl_music)
+        btn_music = icon_button("Choose Music…", "music", "pink", kind="primary")
+        btn_music.clicked.connect(self._set_music)
+        btn_music_ph = icon_button("Start at Playhead", "insert", "teal")
+        btn_music_ph.clicked.connect(self._music_to_playhead)
+        btn_music_del = icon_button("Remove", "trash", "red")
+        btn_music_del.clicked.connect(self._remove_music)
+        lay.addLayout(self._row(btn_music, btn_music_ph, btn_music_del))
+        self.sl_music_vol = self._labeled_slider(lay, "Music Volume", 0, 150, 60, lambda _v: self._on_music_changed(), "%")
+        self.sl_music_duck = self._labeled_slider(lay, "Under Voices", 5, 100, 30, lambda _v: self._on_music_changed(), "%")
+        self.chk_music_loop = QCheckBox("Loop to fill the video")
+        self.chk_music_loop.setChecked(True)
+        self.chk_music_loop.toggled.connect(lambda _c: self._on_music_changed())
+        lay.addWidget(self.chk_music_loop)
+        lay.addWidget(self._muted("'Under Voices' is auto-ducking: the music drops to this level whenever someone speaks."))
+        lay.addStretch()
+
+        # --- 10. Subtitles (AI) ---
+        lay = self._toolbox_page(inspector, "Subtitles — AI Auto-Captions (Whisper)", "text", "violet")
+        eng = whisper_engine_name()
+        self.lbl_sub_engine = self._muted(
+            f"Speech engine: {eng} (runs on this computer, free)." if eng else
+            "Speech engine not installed. Run:  pip install faster-whisper   then restart the app.")
+        lay.addWidget(self.lbl_sub_engine)
         form = QFormLayout()
+        self.cmb_sub_model = QComboBox()
+        self.cmb_sub_model.addItems(["tiny  (fastest)", "base", "small  (recommended)", "medium", "large-v3  (best, slow)"])
+        self.cmb_sub_model.setCurrentIndex(2)
+        self.cmb_sub_lang = QComboBox()
+        for code, name in WHISPER_LANGS:
+            self.cmb_sub_lang.addItem(name, code)
+        self.cmb_sub_task = QComboBox()
+        self.cmb_sub_task.addItems(["Captions in the spoken language", "Translate speech to English"])
+        form.addRow("Model", self.cmb_sub_model)
+        form.addRow("Spoken language", self.cmb_sub_lang)
+        form.addRow("Result", self.cmb_sub_task)
+        lay.addLayout(form)
+        self.btn_gen_subs = icon_button("Generate Subtitles", "sparkle", "violet", kind="accent")
+        self.btn_gen_subs.setEnabled(bool(eng))
+        self.btn_gen_subs.clicked.connect(self._generate_subtitles)
+        lay.addWidget(self.btn_gen_subs)
+        self.lbl_sub_status = self._muted("No subtitles yet.")
+        lay.addWidget(self.lbl_sub_status)
+        btn_sub_edit = icon_button("Edit…", "text", "amber")
+        btn_sub_edit.clicked.connect(self._edit_subtitles)
+        btn_sub_imp = icon_button("Import .SRT", "open", "amber")
+        btn_sub_imp.clicked.connect(self._import_srt)
+        btn_sub_exp = icon_button("Save .SRT", "save", "blue")
+        btn_sub_exp.clicked.connect(self._export_srt)
+        btn_sub_clr = icon_button("", "trash", "red", "Remove all subtitles")
+        btn_sub_clr.clicked.connect(self._clear_subtitles)
+        lay.addLayout(self._row(btn_sub_edit, btn_sub_imp, btn_sub_exp, btn_sub_clr))
+        btn_sub_tr = icon_button("Translate Subtitles To…", "sparkle", "teal")
+        btn_sub_tr.clicked.connect(self._translate_subtitles)
+        lay.addWidget(btn_sub_tr)
+        lay.addWidget(self._section("Caption style"))
+        self.spn_sub_size = QSpinBox()
+        self.spn_sub_size.setRange(2, 15)
+        self.spn_sub_size.setValue(5)
+        self.spn_sub_size.setSuffix(" % height")
+        self.cmb_sub_pos = QComboBox()
+        self.cmb_sub_pos.addItems(["Bottom", "Center", "Top"])
+        self.btn_sub_color = QPushButton("Color")
+        self.btn_sub_color.clicked.connect(lambda: (self._pick_text_color(self.btn_sub_color), self._on_sub_style_changed()))
+        self._set_color_button(self.btn_sub_color, "#FFFFFF")
+        lay.addLayout(self._row(self.spn_sub_size, self.cmb_sub_pos, self.btn_sub_color))
+        self.chk_sub_backdrop = QCheckBox("Dark box behind text")
+        self.chk_sub_backdrop.setChecked(True)
+        self.chk_sub_burn = QCheckBox("Burn into exported video")
+        self.chk_sub_burn.setChecked(True)
+        lay.addLayout(self._row(self.chk_sub_backdrop, self.chk_sub_burn, None))
+        for w_ in (self.spn_sub_size,):
+            w_.valueChanged.connect(lambda _v: self._on_sub_style_changed())
+        self.cmb_sub_pos.currentIndexChanged.connect(lambda _i: self._on_sub_style_changed())
+        self.chk_sub_backdrop.toggled.connect(lambda _c: self._on_sub_style_changed())
+        self.chk_sub_burn.toggled.connect(lambda _c: self._on_sub_style_changed())
+        lay.addStretch()
+
+        # --- 11. Smart Tools ---
+        lay = self._toolbox_page(inspector, "Smart Tools — Scenes, Silence, Face Reframe", "magic", "orange")
+        self.sl_scene_sens = self._labeled_slider(lay, "Scene Sensitivity", 10, 100, 55, lambda _v: None, "%")
+        btn_scenes = icon_button("Split Active Clip at Scene Cuts", "split", "orange", kind="warn")
+        btn_scenes.clicked.connect(lambda: self._detect_scenes(all_clips=False))
+        btn_scenes_all = icon_button("All Clips", "layers", "orange")
+        btn_scenes_all.clicked.connect(lambda: self._detect_scenes(all_clips=True))
+        lay.addLayout(self._row(btn_scenes, btn_scenes_all))
+        lay.addWidget(self._section("Remove silent gaps"))
+        self.spn_sil_db = QSpinBox()
+        self.spn_sil_db.setRange(-70, -15)
+        self.spn_sil_db.setValue(-40)
+        self.spn_sil_db.setSuffix(" dB")
+        self.spn_sil_min = QDoubleSpinBox()
+        self.spn_sil_min.setRange(0.2, 10.0)
+        self.spn_sil_min.setSingleStep(0.1)
+        self.spn_sil_min.setValue(0.7)
+        self.spn_sil_min.setSuffix(" s min")
+        lay.addLayout(self._row(QLabel("Quieter than"), self.spn_sil_db, QLabel("for"), self.spn_sil_min))
+        btn_sil = icon_button("Remove Silences", "mute", "red", kind="danger")
+        btn_sil.clicked.connect(self._remove_silences)
+        lay.addWidget(btn_sil)
+        lay.addWidget(self._section("Vertical reframing"))
+        btn_faces = icon_button("Analyze Faces for Smart 9:16 Reframe", "person", "pink")
+        btn_faces.clicked.connect(self._analyze_faces)
+        lay.addWidget(btn_faces)
+        self.lbl_smart_status = self._muted("Smart reframe keeps the speaker's face centred when you export 9:16 / 1:1.")
+        lay.addWidget(self.lbl_smart_status)
+        lay.addStretch()
+
+        # --- 12. Export ---
+        lay = self._toolbox_page(inspector, "Export — Platforms, GPU & Queue", "export", "green")
+        form = QFormLayout()
+        self.cmb_exp_platform = QComboBox()
+        self.cmb_exp_platform.addItems([p[0] for p in OUTPUT_PRESETS])
+        self.cmb_exp_platform.currentIndexChanged.connect(self._on_platform_preset)
         self.cmb_exp_format = QComboBox()
         self.cmb_exp_format.addItems(["Source size (first clip)", "1080p  16:9  (1920×1080)", "720p  16:9  (1280×720)",
-                                      "Vertical 9:16  (1080×1920) — TikTok / Reels / Shorts", "Square 1:1  (1080×1080)",
-                                      "Portrait 4:5  (1080×1350) — Instagram", "4K  16:9  (3840×2160)"])
+                                      "Vertical 9:16  (1080×1920)", "Square 1:1  (1080×1080)",
+                                      "Portrait 4:5  (1080×1350)", "4K  16:9  (3840×2160)"])
         self.cmb_exp_fit = QComboBox()
-        self.cmb_exp_fit.addItems(["Fit + blurred background", "Fit + black bars", "Fill (crop edges)"])
+        self.cmb_exp_fit.addItems(["Fit + blurred background", "Fit + black bars", "Fill (crop edges)",
+                                   "Smart reframe (follow faces)"])
         self.cmb_exp_fps = QComboBox()
         self.cmb_exp_fps.addItems(["Source FPS", "24", "25", "30", "50", "60"])
         self.cmb_exp_quality = QComboBox()
         self.cmb_exp_quality.addItems(["Maximum (CRF 16)", "High (CRF 19)", "Balanced (CRF 23)", "Small file (CRF 28)"])
         self.cmb_exp_quality.setCurrentIndex(1)
-        self.chk_exp_pitch = QCheckBox("Keep natural voice pitch on speed changes")
-        self.chk_exp_pitch.setChecked(True)
+        self.cmb_exp_encoder = QComboBox()
+        for key, title in ENCODER_LABELS:
+            self.cmb_exp_encoder.addItem(title, key)
+        form.addRow("Platform", self.cmb_exp_platform)
         form.addRow("Size", self.cmb_exp_format)
         form.addRow("Framing", self.cmb_exp_fit)
         form.addRow("Frame rate", self.cmb_exp_fps)
         form.addRow("Quality", self.cmb_exp_quality)
+        form.addRow("Encoder", self.cmb_exp_encoder)
         lay.addLayout(form)
+        self.lbl_exp_warning = QLabel("")
+        self.lbl_exp_warning.setObjectName("Accent")
+        self.lbl_exp_warning.setWordWrap(True)
+        lay.addWidget(self.lbl_exp_warning)
+        self.chk_exp_pitch = QCheckBox("Keep natural voice pitch on speed changes")
+        self.chk_exp_pitch.setChecked(True)
         lay.addWidget(self.chk_exp_pitch)
-        btn_export_vid = icon_button("Export Edited Video (MP4 · H.264 · AAC)", "export", "green", kind="success")
+        btn_export_vid = icon_button("Export Video  (runs in the background)", "export", "green", kind="success")
         btn_export_vid.setMinimumHeight(40)
         btn_export_vid.clicked.connect(self._export_timeline_video)
         lay.addWidget(btn_export_vid)
-        lay.addWidget(self._muted("Encodes with FFmpeg (H.264 + AAC) for phones and social media. Without FFmpeg, MPEG-4 video only."))
+        lay.addWidget(self._section("Export queue — keep editing while it renders"))
+        self.lst_exports = QListWidget()
+        self.lst_exports.setMaximumHeight(110)
+        lay.addWidget(self.lst_exports)
+        btn_exp_cancel = icon_button("Cancel Selected", "stop", "red")
+        btn_exp_cancel.clicked.connect(self._cancel_selected_export)
+        btn_exp_open = icon_button("Open Folder", "open", "amber")
+        btn_exp_open.clicked.connect(self._open_export_folder)
+        lay.addLayout(self._row(btn_exp_cancel, btn_exp_open))
+        self.lbl_encoders = self._muted("Checking which GPU encoders this computer supports…")
+        lay.addWidget(self.lbl_encoders)
         lay.addStretch()
 
         right_wrap = QScrollArea()
@@ -2867,7 +4287,7 @@ class ANKMediaStudio(QMainWindow):
 
         self.timeline_scroll = QScrollArea()
         self.timeline_scroll.setWidgetResizable(True)
-        self.timeline_scroll.setFixedHeight(232)
+        self.timeline_scroll.setFixedHeight(286)
         self.timeline_scroll.setWidget(self.timeline)
         layout.addWidget(self.timeline_scroll)
 
@@ -3129,6 +4549,68 @@ class ANKMediaStudio(QMainWindow):
         lay.addLayout(self._row(btn_p_text_apply, btn_p_text_clear))
         lay.addStretch()
 
+        # --- Layers ---
+        lay = self._toolbox_page(inspector, "Layers — Images, Cut-outs & Text", "layers", "indigo")
+        b_l_img = icon_button("Add Image", "image", "green")
+        b_l_img.clicked.connect(lambda: self._add_photo_layer("image"))
+        b_l_cut = icon_button("Add Cut-out", "person", "teal", "Add a picture with its background removed automatically")
+        b_l_cut.clicked.connect(lambda: self._add_photo_layer("cutout"))
+        b_l_txt = icon_button("Add Text", "text", "amber")
+        b_l_txt.clicked.connect(lambda: self._add_photo_layer("text"))
+        lay.addLayout(self._row(b_l_img, b_l_cut, b_l_txt))
+        self.txt_layer_text = QLineEdit()
+        self.txt_layer_text.setPlaceholderText("Text for a new text layer (use | for a new line)")
+        self.btn_layer_color = QPushButton("Color")
+        self.btn_layer_color.clicked.connect(lambda: self._pick_text_color(self.btn_layer_color))
+        self._set_color_button(self.btn_layer_color, "#FFFFFF")
+        lay.addLayout(self._row(self.txt_layer_text, self.btn_layer_color, stretch_last=False))
+        self.lst_layers = QListWidget()
+        self.lst_layers.setMaximumHeight(120)
+        self.lst_layers.currentRowChanged.connect(self._on_photo_layer_selected)
+        lay.addWidget(self.lst_layers)
+        b_up = icon_button("Up", "to_end", "slate", "Bring forward")
+        b_up.clicked.connect(lambda: self._move_photo_layer(1))
+        b_dn = icon_button("Down", "to_start", "slate", "Send backward")
+        b_dn.clicked.connect(lambda: self._move_photo_layer(-1))
+        b_sel_none = icon_button("Deselect", "eye", "slate", "Move/scale the photo instead of a layer")
+        b_sel_none.clicked.connect(lambda: self.lst_layers.setCurrentRow(-1))
+        b_l_del = icon_button("Delete", "trash", "red")
+        b_l_del.clicked.connect(self._delete_photo_layer)
+        lay.addLayout(self._row(b_up, b_dn, b_sel_none, b_l_del))
+        self.sl_layer_size = self._labeled_slider(lay, "Layer Size", 2, 100, 35, lambda _v: self._on_photo_layer_changed(), "%")
+        self.sl_layer_opacity = self._labeled_slider(lay, "Layer Opacity", 5, 100, 100, lambda _v: self._on_photo_layer_changed(), "%")
+        for sl in (self.sl_layer_size, self.sl_layer_opacity):
+            sl.sliderPressed.connect(self._push_photo_undo)
+        lay.addWidget(self._muted("Select a layer, then use the Free Move tool to drag it (mouse wheel resizes it)."))
+        lay.addStretch()
+
+        # --- Batch & Thumbnails ---
+        lay = self._toolbox_page(inspector, "Batch Edit & Thumbnail Maker", "sparkle", "amber")
+        b_thumb = icon_button("Create YouTube / TikTok Thumbnail…", "image", "red", kind="danger")
+        b_thumb.clicked.connect(self._thumbnail_maker)
+        lay.addWidget(b_thumb)
+        lay.addWidget(self._muted("Big outlined title, your subject cut out, blurred background — ready to tweak with layers."))
+        lay.addWidget(self._section("Batch process many photos"))
+        self.chk_batch_color = QCheckBox("Apply current Adjust + Filter")
+        self.chk_batch_color.setChecked(True)
+        self.chk_batch_text = QCheckBox("Add current text / watermark")
+        self.chk_batch_layers = QCheckBox("Add current layers (e.g. logo)")
+        self.chk_batch_auto = QCheckBox("Auto Enhance each photo")
+        for c in (self.chk_batch_color, self.chk_batch_text, self.chk_batch_layers, self.chk_batch_auto):
+            lay.addWidget(c)
+        lay.addWidget(self._muted("Format, quality and resize come from the File & Export section."))
+        b_batch = icon_button("Choose Photos & Run Batch…", "layers", "violet", kind="accent")
+        b_batch.clicked.connect(self._batch_photos)
+        lay.addWidget(b_batch)
+        lay.addWidget(self._section("AI upscaling engine"))
+        self.lbl_esrgan = self._muted("")
+        lay.addWidget(self.lbl_esrgan)
+        b_esr = icon_button("Locate Real-ESRGAN…", "open", "amber")
+        b_esr.clicked.connect(self._locate_realesrgan)
+        lay.addWidget(b_esr)
+        self._update_esrgan_label()
+        lay.addStretch()
+
         side_scroll = QScrollArea()
         side_scroll.setWidgetResizable(True)
         side_scroll.setMinimumWidth(440)
@@ -3154,10 +4636,13 @@ class ANKMediaStudio(QMainWindow):
     # PHOTO STUDIO LOGIC (WITH UNDO + REDO)
     # ==========================================================================
     def _photo_snapshot(self):
-        return (self.photo_base_bgra.copy(), self.photo_transform.clone(), self.photo_color.clone(), self.photo_text.clone())
+        return (self.photo_base_bgra.copy(), self.photo_transform.clone(), self.photo_color.clone(), self.photo_text.clone(),
+                [ly.clone() for ly in self.photo_layers])
 
     def _restore_photo_snapshot(self, snap):
-        base, tf, col, txt = snap
+        base, tf, col, txt, layers = snap
+        self.photo_layers = layers
+        self._refresh_layer_list()
         base_changed = self.photo_base_bgra is None or base.shape != self.photo_base_bgra.shape or not np.array_equal(base, self.photo_base_bgra)
         self.photo_base_bgra, self.photo_transform, self.photo_color, self.photo_text = base, tf, col, txt
         if base_changed:
@@ -3235,6 +4720,8 @@ class ANKMediaStudio(QMainWindow):
         if self.photo_text.active() and not self._photo_compare:
             ch, cw = comp.shape[:2]
             comp = composite_bgra_over(comp, render_text_layer(cw, ch, self.photo_text))
+        if self.photo_layers and not self._photo_compare:
+            comp = composite_layers(comp, self.photo_layers)
         self.photo_canvas.brush_scale = s
         self.photo_canvas.overlay_label = "ORIGINAL" if self._photo_compare else ""
         self.photo_canvas.load_image(comp, preserve_masks=preserve_masks)
@@ -3256,6 +4743,11 @@ class ANKMediaStudio(QMainWindow):
             comp = composite_bgra_over(comp, layer)
             rgb = composite_bgra_over(warped[:, :, :3], layer)
             warped = cv2.merge([rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2], np.maximum(warped[:, :, 3], layer[:, :, 3])])
+        if self.photo_layers:
+            comp = composite_layers(comp, self.photo_layers)
+            alpha = warped[:, :, 3].copy()
+            rgb = composite_layers(np.ascontiguousarray(warped[:, :, :3]), self.photo_layers, alpha)
+            warped = cv2.merge([rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2], alpha])
         return comp, warped
 
     def _bake_photo_transform_into_base(self):
@@ -3292,6 +4784,8 @@ class ANKMediaStudio(QMainWindow):
         self.photo_undo_stack.clear()
         self.photo_redo_stack.clear()
         self.photo_base_bgra = raw
+        self.photo_layers = []
+        self._refresh_layer_list()
         self.photo_path = path
         self.photo_transform = TransformParams()
         self.photo_color = ColorParams()
@@ -3395,6 +4889,13 @@ class ANKMediaStudio(QMainWindow):
     def _on_photo_free_moved(self, dx: int, dy: int):
         if self.photo_base_bgra is None:
             return
+        ly = self._selected_photo_layer()
+        if ly is not None and self.photo_canvas.cv_image is not None:
+            ch, cw = self.photo_canvas.cv_image.shape[:2]
+            ly.cx = max(-0.2, min(1.2, ly.cx + dx / cw))
+            ly.cy = max(-0.2, min(1.2, ly.cy + dy / ch))
+            self._refresh_photo_canvas()
+            return
         s = self.photo_preview_scale
         self.photo_transform.offset_x += int(round(dx / s))
         self.photo_transform.offset_y += int(round(dy / s))
@@ -3402,6 +4903,12 @@ class ANKMediaStudio(QMainWindow):
 
     def _on_photo_wheel_scaled(self, factor: float):
         if self.photo_base_bgra is None:
+            return
+        ly = self._selected_photo_layer()
+        if ly is not None:
+            ly.width_frac = max(0.02, min(1.5, ly.width_frac * factor))
+            self._set_slider_silently(self.sl_layer_size, int(min(100, ly.width_frac * 100)))
+            self._refresh_photo_canvas()
             return
         self.photo_transform.scale = max(0.10, min(3.00, self.photo_transform.scale * factor))
         self._sync_photo_ui_sliders()
@@ -3416,16 +4923,7 @@ class ANKMediaStudio(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def _apply_photo_ai_upscale(self):
-        if self.photo_base_bgra is None:
-            return
-        self._push_photo_undo()
-        self.photo_base_bgra = self._with_busy("Running AI Super-Resolution 2x upscale…",
-                                               lambda: ai_super_res_upscale(self.photo_base_bgra, factor=2))
-        self._rebuild_photo_preview()
-        self._refresh_photo_canvas()
-        h, w = self.photo_base_bgra.shape[:2]
-        self.status.showMessage(f"AI Super-Resolution 2x complete. New resolution: {w}x{h}")
+
 
     def _exec_photo_crop(self, rect: QRect):
         if self.photo_base_bgra is None:
@@ -3694,6 +5192,288 @@ class ANKMediaStudio(QMainWindow):
 
 
     # ==========================================================================
+    # v3: PHOTO LAYERS, REAL-ESRGAN, BATCH, THUMBNAIL MAKER
+    # ==========================================================================
+    def _refresh_layer_list(self):
+        self.lst_layers.blockSignals(True)
+        cur = self.lst_layers.currentRow()
+        self.lst_layers.clear()
+        for ly in reversed(self.photo_layers):      # top layer first, like design apps
+            self.lst_layers.addItem(f"{'T' if ly.kind == 'text' else '▣'}  {ly.name}")
+        self.lst_layers.setCurrentRow(min(cur, len(self.photo_layers) - 1))
+        self.lst_layers.blockSignals(False)
+
+    def _selected_photo_layer(self):
+        row = self.lst_layers.currentRow()
+        if row < 0 or row >= len(self.photo_layers):
+            return None
+        return self.photo_layers[len(self.photo_layers) - 1 - row]
+
+    def _add_photo_layer(self, kind: str):
+        if self.photo_base_bgra is None:
+            self.status.showMessage("Open a photo first, then add layers on top.")
+            return
+        ly = None
+        if kind in ("image", "cutout"):
+            path, _ = QFileDialog.getOpenFileName(self, "Add Layer Image", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+            if not path:
+                return
+            img = load_image_bgra(path)
+            if img is None:
+                QMessageBox.warning(self, "Layer", "Could not read that image.")
+                return
+            if kind == "cutout":
+                img = self._with_busy("Cutting out the subject…", lambda: self._cutout_bgra(img))
+            ly = PhotoLayer("image", os.path.basename(path))
+            ly.bgra = img
+            ly.width_frac = 0.4
+        else:
+            text = self.txt_layer_text.text().strip() or "Your Title"
+            ly = PhotoLayer("text", text.replace("|", " "))
+            ly.text.text = text.replace("|", "\n")
+            ly.text.color = getattr(self.btn_layer_color, "_color", "#FFFFFF")
+            ly.text.outline = True
+            ly.bgra = render_text_image(ly.text, 160)
+            ly.width_frac = 0.6
+            ly.cy = 0.82
+        self._push_photo_undo()
+        self.photo_layers.append(ly)
+        self._refresh_layer_list()
+        self.lst_layers.setCurrentRow(0)
+        self._refresh_photo_canvas()
+        self._set_photo_mode("move")
+
+    def _cutout_bgra(self, img: np.ndarray) -> np.ndarray:
+        bgr = np.ascontiguousarray(img[:, :, :3])
+        if HAS_REMBG:
+            rgba = np.array(rembg_remove(Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))))
+            return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+        h, w = bgr.shape[:2]
+        s = min(1.0, 640.0 / max(h, w))
+        small = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+        sh, sw = small.shape[:2]
+        mask = np.zeros((sh, sw), np.uint8)
+        alpha = self._grabcut_alpha(small, mask, (int(sw * 0.06), int(sh * 0.06), int(sw * 0.88), int(sh * 0.88)))
+        alpha = cv2.GaussianBlur(cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR), (0, 0), max(0.8, w / 1500.0))
+        return cv2.merge([bgr[:, :, 0], bgr[:, :, 1], bgr[:, :, 2], alpha])
+
+    def _on_photo_layer_selected(self, _row):
+        ly = self._selected_photo_layer()
+        if ly:
+            self._set_slider_silently(self.sl_layer_size, int(ly.width_frac * 100))
+            self._set_slider_silently(self.sl_layer_opacity, int(ly.opacity * 100))
+            self.status.showMessage(f"Layer '{ly.name}' selected — Free Move drags it, the wheel resizes it.")
+
+    def _on_photo_layer_changed(self):
+        ly = self._selected_photo_layer()
+        if ly:
+            ly.width_frac = self.sl_layer_size.value() / 100.0
+            ly.opacity = self.sl_layer_opacity.value() / 100.0
+            self._refresh_photo_canvas(preserve_masks=True)
+
+    def _move_photo_layer(self, direction: int):
+        ly = self._selected_photo_layer()
+        if not ly:
+            return
+        i = self.photo_layers.index(ly)
+        j = max(0, min(len(self.photo_layers) - 1, i + direction))
+        if i != j:
+            self._push_photo_undo()
+            self.photo_layers[i], self.photo_layers[j] = self.photo_layers[j], self.photo_layers[i]
+            self._refresh_layer_list()
+            self.lst_layers.setCurrentRow(len(self.photo_layers) - 1 - j)
+            self._refresh_photo_canvas()
+
+    def _delete_photo_layer(self):
+        ly = self._selected_photo_layer()
+        if ly:
+            self._push_photo_undo()
+            self.photo_layers.remove(ly)
+            self._refresh_layer_list()
+            self._refresh_photo_canvas()
+
+    # --- Real-ESRGAN ---
+    def _update_esrgan_label(self):
+        exe = find_realesrgan(str(self.settings.value("realesrgan", "") or ""))
+        self.lbl_esrgan.setText(f"Real-ESRGAN ready: {os.path.basename(exe)} — AI Upsize uses it." if exe else
+                                "Real-ESRGAN not found — AI Upsize uses the built-in sharpener. For true AI detail, download "
+                                "'realesrgan-ncnn-vulkan' (free, GitHub: xinntao/Real-ESRGAN) and point to it here.")
+
+    def _locate_realesrgan(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Locate realesrgan-ncnn-vulkan", "", "Programs (*.exe);;All files (*)")
+        if p:
+            self.settings.setValue("realesrgan", p)
+            self._update_esrgan_label()
+
+    def _apply_photo_ai_upscale(self):
+        if self.photo_base_bgra is None:
+            return
+        self._push_photo_undo()
+        exe = find_realesrgan(str(self.settings.value("realesrgan", "") or ""))
+
+        def work():
+            base = self.photo_base_bgra
+            if exe:
+                try:
+                    up = realesrgan_upscale(exe, np.ascontiguousarray(base[:, :, :3]), 4)
+                    h, w = base.shape[:2]
+                    up = cv2.resize(up, (w * 2, h * 2), interpolation=cv2.INTER_AREA)
+                    alpha = cv2.resize(base[:, :, 3], (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
+                    return cv2.merge([up[:, :, 0], up[:, :, 1], up[:, :, 2], alpha]), "Real-ESRGAN"
+                except Exception as e:
+                    self.status.showMessage(f"Real-ESRGAN failed ({e}); using the built-in upscaler.")
+            return ai_super_res_upscale(base, factor=2), "built-in"
+        self.photo_base_bgra, engine = self._with_busy("AI upscaling 2x…", work)
+        self._rebuild_photo_preview()
+        self._refresh_photo_canvas()
+        h, w = self.photo_base_bgra.shape[:2]
+        self.status.showMessage(f"Upscaled 2x with {engine}. New resolution: {w}×{h}")
+
+    # --- Batch ---
+    def _batch_photos(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Choose Photos to Process", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)")
+        if not files:
+            return
+        out_dir = QFileDialog.getExistingDirectory(self, "Save Processed Photos To", os.path.dirname(files[0]))
+        if not out_dir:
+            return
+        fmt = self.cmb_p_format.currentText()
+        ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}[fmt]
+        q = self.spn_p_quality.value()
+        long_edge = self.spn_p_long_edge.value()
+        color = self.photo_color.clone() if self.chk_batch_color.isChecked() else None
+        text = self.photo_text.clone() if self.chk_batch_text.isChecked() and self.photo_text.active() else None
+        layers = [ly.clone() for ly in self.photo_layers] if self.chk_batch_layers.isChecked() else []
+        auto = self.chk_batch_auto.isChecked()
+        prog = QProgressDialog("Processing photos…", "Cancel", 0, len(files), self)
+        prog.setWindowTitle("Batch")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        state = {"done": 0, "failed": [], "cancel": False}
+
+        def work():
+            for path in files:
+                if state["cancel"]:
+                    break
+                try:
+                    img = load_image_bgra(path)
+                    if img is None:
+                        raise RuntimeError("unreadable")
+                    bgr = np.ascontiguousarray(img[:, :, :3])
+                    if auto:
+                        bgr = auto_enhance(bgr)
+                    if color:
+                        bgr = apply_color(bgr, color)
+                    if long_edge > 0:
+                        h, w = bgr.shape[:2]
+                        s = long_edge / max(h, w)
+                        bgr = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LANCZOS4)
+                    h, w = bgr.shape[:2]
+                    if text:
+                        bgr = composite_bgra_over(bgr, render_text_layer(w, h, text))
+                    if layers:
+                        bgr = composite_layers(bgr, layers)
+                    params = {".jpg": [cv2.IMWRITE_JPEG_QUALITY, q], ".webp": [cv2.IMWRITE_WEBP_QUALITY, q], ".png": [cv2.IMWRITE_PNG_COMPRESSION, 3]}[ext]
+                    ok, buf = cv2.imencode(ext, bgr, params)
+                    if not ok:
+                        raise RuntimeError("encode failed")
+                    buf.tofile(os.path.join(out_dir, os.path.splitext(os.path.basename(path))[0] + "_ank" + ext))
+                except Exception as e:
+                    state["failed"].append(f"{os.path.basename(path)}: {e}")
+                state["done"] += 1
+                self._bridge.call.emit(lambda: prog.setValue(state["done"]))
+
+            def finish():
+                prog.close()
+                ok_n = state["done"] - len(state["failed"])
+                msg = f"Batch finished: {ok_n} photo(s) saved to {out_dir}"
+                if state["failed"]:
+                    msg += "\n\nSkipped:\n" + "\n".join(state["failed"][:10])
+                QMessageBox.information(self, "Batch", msg)
+                self.status.showMessage(msg.split("\n")[0])
+            self._bridge.call.emit(finish)
+        prog.canceled.connect(lambda: state.__setitem__("cancel", True))
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- Thumbnail / cover maker ---
+    def _thumbnail_maker(self):
+        if self.photo_base_bgra is None:
+            QMessageBox.information(self, "Thumbnail Maker", "Open the photo (or send a video frame) you want on the thumbnail first.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Thumbnail Maker")
+        form = QFormLayout(dlg)
+        t1, t2 = QLineEdit("YOU WON'T BELIEVE"), QLineEdit("WHAT HAPPENED")
+        size_cb = QComboBox()
+        size_cb.addItems(["YouTube 16:9 (1280×720)", "TikTok / Reels cover 9:16 (1080×1920)", "Square 1:1 (1080×1080)"])
+        accent_btn = QPushButton("Accent")
+        self._set_color_button(accent_btn, "#FACC15")
+        accent_btn.clicked.connect(lambda: self._pick_text_color(accent_btn))
+        cut_chk = QCheckBox("Cut out the subject and place it beside the text")
+        cut_chk.setChecked(True)
+        form.addRow("Title line 1", t1)
+        form.addRow("Title line 2", t2)
+        form.addRow("Size", size_cb)
+        form.addRow("Highlight colour", accent_btn)
+        form.addRow(cut_chk)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        W, H = [(1280, 720), (1080, 1920), (1080, 1080)][size_cb.currentIndex()]
+        accent = getattr(accent_btn, "_color", "#FACC15")
+        src = np.ascontiguousarray(apply_color(self.photo_base_bgra, self.photo_color)[:, :, :3])
+
+        def build():
+            bg = fit_into_frame(src, W, H, "fill")
+            bg = cv2.convertScaleAbs(cv2.GaussianBlur(bg, (0, 0), max(6, W / 90)), alpha=0.55)
+            cp = ColorParams()
+            cp.saturation, cp.contrast, cp.vignette = 25, 15, 45
+            bg = apply_color(bg, cp)
+            layers = []
+            if cut_chk.isChecked():
+                cut = self._cutout_bgra(to_bgra(src))
+                ys, xs = np.nonzero(cut[:, :, 3] > 40)
+                if len(xs):
+                    cut = cut[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                ly = PhotoLayer("image", "Subject")
+                ly.bgra = cut
+                landscape = W > H
+                ly.width_frac = 0.42 if landscape else 0.85
+                ly.cx, ly.cy = (0.74, 0.55) if landscape else (0.5, 0.66)
+                layers.append(ly)
+            for k, line in enumerate((t1.text().strip(), t2.text().strip())):
+                if not line:
+                    continue
+                ly = PhotoLayer("text", line)
+                ly.text.text = line
+                ly.text.color = "#FFFFFF" if k == 0 else accent
+                ly.text.outline = True
+                ly.bgra = render_text_image(ly.text, 170, "#000000")
+                landscape = W > H
+                ly.width_frac = 0.52 if landscape else 0.9
+                ly.cx = 0.3 if landscape else 0.5
+                ly.cy = (0.36 + 0.24 * k) if landscape else (0.14 + 0.11 * k)
+                layers.append(ly)
+            return bg, layers
+        bg, layers = self._with_busy("Building the thumbnail…", build)
+        self._push_photo_undo()
+        self.photo_base_bgra = to_bgra(bg)
+        self.photo_transform = TransformParams()
+        self.photo_color = ColorParams()
+        self.photo_text = TextOverlay()
+        self.photo_layers = layers
+        self.photo_path = "thumbnail.jpg"
+        self._rebuild_photo_preview()
+        self._sync_photo_ui_sliders()
+        self._refresh_layer_list()
+        self._refresh_photo_canvas()
+        self.status.showMessage(f"Thumbnail ready ({W}×{H}). Select a layer to move or resize it, then Save Photo.")
+
+
+    # ==========================================================================
     # VIDEO STUDIO: UNDO/REDO, RIGHT-CLICK CONTEXT MENU, & LOCKED/STEM TRIMMING
     # ==========================================================================
     def _video_snapshot(self):
@@ -3705,6 +5485,7 @@ class ANKMediaStudio(QMainWindow):
         )
 
     def _push_video_undo(self):
+        self._mark_dirty()
         self.video_undo_stack.append(self._video_snapshot())
         if len(self.video_undo_stack) > 40:
             self.video_undo_stack.pop(0)
@@ -4007,6 +5788,8 @@ class ANKMediaStudio(QMainWindow):
             )
             self.sources_legend_layout.insertWidget(self.sources_legend_layout.count() - 1, badge)
             self._load_source_audio_async(src)
+            self._make_thumbs_async(src)
+            self._make_proxy_async(src)
 
         if failed:
             QMessageBox.warning(self, "Some files could not be opened",
@@ -4052,6 +5835,7 @@ class ANKMediaStudio(QMainWindow):
             return
 
         self._separating.add(src.source_id)
+        engine = self.cmb_sep_engine.currentData()
         self.btn_sep_audio.setEnabled(False)
         self.lbl_sep_progress.setText(f"Separating V{src.source_id}: reading soundtrack…")
         last_pct = [-1]
@@ -4068,15 +5852,31 @@ class ANKMediaStudio(QMainWindow):
                 if not src.ensure_raw_audio():
                     msg = f"[V{src.source_id}] has no audio track to separate."
                 else:
-                    vox, mus, nse = AudioStemProcessor.separate_audio(src.raw_audio, src.sample_rate, progress=report)
+                    if engine == "demucs":
+                        tmp = os.path.join(tempfile.gettempdir(), f"ank_dm_{os.getpid()}_{src.source_id}.wav")
+                        write_wav_float(tmp, src.raw_audio, src.sample_rate)
+                        try:
+                            vocals, rest = demucs_separate(tmp, src.sample_rate, progress=report)
+                        finally:
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                        n = min(len(vocals), len(rest), len(src.raw_audio))
+                        # Demucs gives clean vocals; the accompaniment is split into music and noise bands
+                        v_band, m_band, nse = AudioStemProcessor.separate_audio(rest[:n], src.sample_rate)
+                        vox, mus = vocals[:n], v_band + m_band
+                    else:
+                        vox, mus, nse = AudioStemProcessor.separate_audio(src.raw_audio, src.sample_rate, progress=report)
                     src.voices_data, src.music_data, src.noise_data = vox, mus, nse
+                    src.stems_engine = engine
                     envs = dict(src.envelopes or {})
                     envs.update({"voices": AudioStemProcessor.envelope(vox), "music": AudioStemProcessor.envelope(mus),
                                  "noise": AudioStemProcessor.envelope(nse)})
                     src.envelopes = envs
                     src.stems_separated = True
                     ok = True
-                    msg = f"Separated [V{src.source_id}] into Voices, Music and Noises."
+                    msg = f"Separated [V{src.source_id}] into Voices, Music and Noises ({'AI Demucs' if engine == 'demucs' else 'fast filter'})."
             except Exception as e:
                 msg = f"Audio separation failed: {e}"
 
@@ -4166,9 +5966,9 @@ class ANKMediaStudio(QMainWindow):
                 mid_source_ms = min(seg.out_ms - 1, max(seg.in_ms + 1, seg.in_ms + source_offset_ms))
 
                 left_seg = TimelineSegment(seg.source, seg.in_ms, mid_source_ms, seg.crop_rect, seg.transform, seg.speed,
-                                           seg.audio_mix, seg.color, seg.text, seg.fade_in_ms, 0)
+                                           seg.audio_mix, seg.color, seg.text, seg.fade_in_ms, 0, seg.transition, seg.motion)
                 right_seg = TimelineSegment(seg.source, mid_source_ms, seg.out_ms, seg.crop_rect, seg.transform, seg.speed,
-                                            seg.audio_mix, seg.color, seg.text, 0, seg.fade_out_ms)
+                                            seg.audio_mix, seg.color, seg.text, 0, seg.fade_out_ms, None, seg.motion)
                 left_seg.audio_mix.fade_out_ms = 0
                 right_seg.audio_mix.fade_in_ms = 0
 
@@ -4350,6 +6150,8 @@ class ANKMediaStudio(QMainWindow):
         self._render_frame_at_ms(self.timeline.playhead_ms)
 
     def _toggle_video_free_move(self, checked: bool):
+        if checked and self.chk_output_view.isChecked():
+            self.chk_output_view.setChecked(False)
         if checked:
             self.btn_crop_vid.setChecked(False)
             self.video_Canvas.mode = "move"
@@ -4408,6 +6210,7 @@ class ANKMediaStudio(QMainWindow):
         if bg_img is not None:
             self._push_video_undo()
             seg.transform.bg_replacement = bg_img
+            seg.transform.bg_path = path
             self._render_frame_at_ms(self.timeline.playhead_ms)
 
     def _clear_video_custom_bg(self):
@@ -4632,6 +6435,8 @@ class ANKMediaStudio(QMainWindow):
         self._render_frame_at_ms(m1)
 
     def _toggle_video_spatial_crop(self, checked: bool):
+        if checked and self.chk_output_view.isChecked():
+            self.chk_output_view.setChecked(False)
         if checked:
             self.btn_move_vid.setChecked(False)
             self.video_Canvas.mode = "crop"
@@ -4690,8 +6495,8 @@ class ANKMediaStudio(QMainWindow):
             self._sync_video_transform_ui(seg)
         if self.is_playing:
             self._play_start_ms = ms
-            self._play_clock.restart()
             self._start_preview_audio()
+            self._play_clock.restart()       # start timing only once the sound is ready
         self._render_frame_at_ms(ms)
 
     def _seek_relative(self, delta_ms: int):
@@ -4726,8 +6531,8 @@ class ANKMediaStudio(QMainWindow):
                     tl.lock_b and tl.mark_b_ms is not None and abs(tl.playhead_ms - tl.mark_b_ms) <= 40):
                 tl.playhead_ms = 0                      # at the end (or stopped at a locked B): start over
             self._play_start_ms = tl.playhead_ms
+            self._start_preview_audio()      # may take a moment the first time (builds the mix)
             self._play_clock.start()
-            self._start_preview_audio()
             self.play_timer.start()
             self.btn_play.setIcon(make_icon("pause", "amber"))
         else:
@@ -4741,9 +6546,9 @@ class ANKMediaStudio(QMainWindow):
             marks = self._get_valid_marks(quiet=True)
             if marks and nxt >= marks[1]:
                 self._play_start_ms = marks[0]
-                self._play_clock.restart()
                 nxt = marks[0]
                 self._start_preview_audio(nxt)
+                self._play_clock.restart()
         total = self.timeline.total_duration_ms()
         tl = self.timeline
         stop_at = total
@@ -4810,73 +6615,17 @@ class ANKMediaStudio(QMainWindow):
     # --- FRAME PIPELINE (shared by preview, snapshots and export) ---
     def _process_video_frame(self, frame: np.ndarray, seg: TimelineSegment, canvas_wh: tuple[int, int],
                              preview_mode: bool = True, scale: float = 1.0, local_ms: float = None) -> np.ndarray:
-        cw, ch = canvas_wh
-        crop = seg.crop_rect
-        tf = seg.transform
-        if scale < 0.999:
-            fh, fw = frame.shape[:2]
-            frame = cv2.resize(frame, (max(1, int(fw * scale)), max(1, int(fh * scale))), interpolation=cv2.INTER_AREA)
-            cw, ch = max(1, int(cw * scale)), max(1, int(ch * scale))
-            if crop:
-                crop = tuple(int(round(v * scale)) for v in crop)
-            tf = tf.scaled(scale)
-
-        if crop:
-            x, y, w, h = crop
-            fh, fw = frame.shape[:2]
-            frame = frame[max(0, y):min(fh, y + h), max(0, x):min(fw, x + w)]
-            if frame.size == 0:
-                frame = np.zeros((ch, cw, 3), np.uint8)
-            frame = fit_into_frame(frame, cw, ch, "fit")   # crop fills the frame (keeps aspect)
-
-        if tf.transparent_bg:
-            if HAS_REMBG:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_out = rembg_remove(Image.fromarray(rgb))
-                frame = cv2.cvtColor(np.array(pil_out), cv2.COLOR_RGBA2BGRA)
-            else:
-                fh, fw = frame.shape[:2]
-                s_gc = min(1.0, 480.0 / max(fh, fw))
-                small = cv2.resize(frame, (max(1, int(fw * s_gc)), max(1, int(fh * s_gc))), interpolation=cv2.INTER_AREA)
-                sh, sw = small.shape[:2]
-                mask = np.zeros((sh, sw), np.uint8)
-                rect = (int(sw * 0.1), int(sh * 0.1), int(sw * 0.8), int(sh * 0.8))
-                bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
-                cv2.grabCut(small, mask, rect, bgd, fgd, 2, cv2.GC_INIT_WITH_RECT)
-                alpha = np.where((mask == 2) | (mask == 0), 0, 255).astype("uint8")
-                alpha = cv2.GaussianBlur(cv2.resize(alpha, (fw, fh), interpolation=cv2.INTER_LINEAR), (0, 0), 1.5)
-                frame = cv2.merge([frame[:, :, 0], frame[:, :, 1], frame[:, :, 2], alpha])
-
-        if tf.ai_upscale:
-            frame = ai_super_res_upscale(frame, factor=2)
-            frame = cv2.resize(frame, (cw, ch), interpolation=cv2.INTER_AREA)
-
-        frame = apply_color(frame, seg.color)
-        comp_bgr, _ = apply_transform_pipeline(frame, tf, canvas_size=(cw, ch), for_preview_checkerboard=preview_mode)
-        if comp_bgr.ndim == 3 and comp_bgr.shape[2] == 4:
-            comp_bgr = comp_bgr[:, :, :3]
-
-        if seg.text.active():
-            comp_bgr = composite_bgra_over(comp_bgr, render_text_layer(cw, ch, seg.text))
-
-        if local_ms is not None and (seg.fade_in_ms > 0 or seg.fade_out_ms > 0):
-            k = 1.0
-            if seg.fade_in_ms > 0 and local_ms < seg.fade_in_ms:
-                k = min(k, local_ms / seg.fade_in_ms)
-            if seg.fade_out_ms > 0 and local_ms > seg.duration_ms - seg.fade_out_ms:
-                k = min(k, (seg.duration_ms - local_ms) / seg.fade_out_ms)
-            if k < 0.999:
-                comp_bgr = cv2.convertScaleAbs(comp_bgr, alpha=max(0.0, k))
-        return comp_bgr
+        return process_clip_frame(frame, seg, canvas_wh, preview_mode, scale, local_ms)
 
     def _render_frame_at_ms(self, global_ms: int):
         total = self.timeline.total_duration_ms()
+        self._update_export_warning()
         self.lbl_time_counter.setText(f"{format_ms(global_ms)} / {format_ms(total)}")
 
         seg, source_ms = self._get_segment_at_ms(global_ms)
         if not seg:
             self.lbl_active_clip_badge.setText("Active Clip: None")
-            self.lbl_active_clip_badge.setStyleSheet("padding: 5px 10px; border-radius: 7px; background: #1f2937;")
+            self.lbl_active_clip_badge.setStyleSheet("")
             return
 
         speed_badge = f" [{seg.speed:.2f}x]" if abs(seg.speed - 1.0) > 0.01 else ""
@@ -4889,6 +6638,13 @@ class ANKMediaStudio(QMainWindow):
             f"padding: 5px 10px; border-radius: 7px; color: white; font-weight: bold; border: 1px solid {c.lighter(160).name()};"
             f"background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c.lighter(125).name()}, stop:1 {c.darker(150).name()});"
         )
+
+        if self.chk_output_view.isChecked():
+            # Exactly what the export will look like (framing, transitions, layers, subtitles)
+            ctx = self._preview_context()
+            self.video_preview_scale = 1.0
+            self.video_Canvas.load_image(ctx.frame_at(global_ms))
+            return
 
         reader = self.open_captures.get(seg.source.source_id)
         if not reader:
@@ -4936,6 +6692,8 @@ class ANKMediaStudio(QMainWindow):
         self.photo_undo_stack.clear()
         self.photo_redo_stack.clear()
         self.photo_base_bgra = to_bgra(img)
+        self.photo_layers = []
+        self._refresh_layer_list()
         self.photo_path = f"{os.path.splitext(seg.source.filename)[0]}_frame.png"
         self.photo_transform = TransformParams()
         self.photo_color = ColorParams()
@@ -4950,66 +6708,7 @@ class ANKMediaStudio(QMainWindow):
     # AUDIO MIX & EXPORT
     # ==========================================================================
     def _build_timeline_audio(self, keep_pitch: bool = True):
-        """
-        Builds the whole timeline's soundtrack: separated stems with their volumes and independent trims,
-        or the clip's original audio when it was never separated, plus speed, clip volume and fades.
-        Returns (sample_rate, float32 stereo) or None when no clip has sound.
-        """
-        sr = 44100
-        chunks = []
-        any_audio = False
-
-        for seg in self.timeline.segments:
-            src = seg.source
-            src.ensure_raw_audio()
-            target_len = max(1, int(round((seg.duration_ms / 1000.0) * sr)))
-            am = seg.audio_mix
-            s0 = int((seg.in_ms / 1000.0) * src.sample_rate)
-            s1 = int((seg.out_ms / 1000.0) * src.sample_rate)
-
-            mixed = None
-            if am.separated and src.stems_separated and src.voices_data is not None:
-                # Mix in the source's own time base; stem trims are converted from timeline ms
-                src_len = max(1, s1 - s0)
-                mixed = np.zeros((src_len, 2), dtype=np.float32)
-                for key, data, vol in (("voices", src.voices_data, am.voices_vol),
-                                       ("music", src.music_data, am.music_vol),
-                                       ("noise", src.noise_data, am.noise_vol)):
-                    if vol <= 0.0:
-                        continue
-                    part = data[s0:s1] * vol
-                    t_s = int((am.stem_trim_start.get(key, 0) * seg.speed / 1000.0) * src.sample_rate)
-                    t_e = int((am.stem_trim_end.get(key, 0) * seg.speed / 1000.0) * src.sample_rate)
-                    if t_s > 0:
-                        part[:min(len(part), t_s)] = 0.0
-                    if t_e > 0:
-                        part[max(0, len(part) - t_e):] = 0.0
-                    mixed[:len(part)] += part
-                any_audio = True
-            elif src.raw_audio is not None:
-                mixed = src.raw_audio[s0:s1].copy()
-                any_audio = True
-
-            if mixed is None or len(mixed) == 0:
-                chunks.append(np.zeros((target_len, 2), dtype=np.float32))
-                continue
-
-            out = time_stretch(mixed, sr, seg.speed, target_len, keep_pitch=keep_pitch)
-            if abs(am.gain - 1.0) > 1e-3:
-                out = out * am.gain
-            fi = int(max(am.fade_in_ms, seg.fade_in_ms) * sr / 1000)
-            fo = int(max(am.fade_out_ms, seg.fade_out_ms) * sr / 1000)
-            if fi > 0:
-                fi = min(fi, len(out))
-                out[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)[:, None]
-            if fo > 0:
-                fo = min(fo, len(out))
-                out[len(out) - fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)[:, None]
-            chunks.append(np.clip(out, -1.0, 1.0))
-
-        if not any_audio or not chunks:
-            return None
-        return sr, np.vstack(chunks).astype(np.float32)
+        return build_timeline_audio(self.timeline.segments, self.music, keep_pitch=keep_pitch)
 
     def _build_mixed_timeline_wav(self, out_wav_path: str, keep_pitch: bool = True) -> bool:
         built = self._build_timeline_audio(keep_pitch=keep_pitch)
@@ -5018,148 +6717,1384 @@ class ANKMediaStudio(QMainWindow):
         write_wav_float(out_wav_path, built[1], built[0])
         return True
 
-    _X264 = None
 
-    @classmethod
-    def _has_x264(cls) -> bool:
-        if cls._X264 is None:
+    # ==========================================================================
+    # v3: FINAL-OUTPUT PREVIEW
+    # ==========================================================================
+    def _export_target(self):
+        """(width, height, fps, fit_mode) from the Export settings."""
+        first = self.timeline.segments[0].source if self.timeline.segments else None
+        presets = [None, (1920, 1080), (1280, 720), (1080, 1920), (1080, 1080), (1080, 1350), (3840, 2160)]
+        size = presets[self.cmb_exp_format.currentIndex()] or ((first.width, first.height) if first else (1280, 720))
+        out_w, out_h = max(2, size[0] // 2 * 2), max(2, size[1] // 2 * 2)
+        fps_txt = self.cmb_exp_fps.currentText()
+        fps = (round(first.fps, 3) if first else 30.0) if fps_txt.startswith("Source") else float(fps_txt)
+        fit = ("blur", "fit", "fill", "smart")[self.cmb_exp_fit.currentIndex()]
+        return out_w, out_h, max(10.0, min(120.0, fps)), fit
+
+    def _sub_style_overlay(self) -> TextOverlay:
+        st = TextOverlay()
+        st.size_pct = self.spn_sub_size.value()
+        st.position = TextOverlay.POSITIONS[self.cmb_sub_pos.currentIndex()]
+        st.color = getattr(self.btn_sub_color, "_color", "#FFFFFF")
+        st.outline = True
+        st.backdrop = self.chk_sub_backdrop.isChecked()
+        return st
+
+    def _preview_context(self):
+        out_w, out_h, _fps, fit = self._export_target()
+        s = min(1.0, 960.0 / max(out_w, out_h))
+        pw, ph = max(2, int(out_w * s) // 2 * 2), max(2, int(out_h * s) // 2 * 2)
+        ctx = getattr(self, "_pv_ctx", None)
+        if ctx is None or (ctx.out_w, ctx.out_h, ctx.fit_mode) != (pw, ph, fit):
+            if ctx is not None:
+                ctx.release()
+            ctx = RenderContext([], [], [], None, False, pw, ph, fit, preview=True, use_proxies=True)
+            self._pv_ctx = ctx
+        ctx.segments = self.timeline.segments
+        ctx.overlays = self.overlays
+        ctx.subtitles = self.subtitles
+        ctx.sub_style = self._sub_style_overlay()
+        ctx.burn_subs = True
+        ctx.starts, acc = [], 0
+        for sgm in ctx.segments:
+            ctx.starts.append(acc)
+            acc += sgm.duration_ms
+        ctx.total = acc
+        ctx._clip_cache.clear()
+        return ctx
+
+    def _on_output_view_toggled(self, on: bool):
+        if on:
+            self.btn_crop_vid.setChecked(False)
+            self.btn_move_vid.setChecked(False)
+            self.video_Canvas.mode = "none"
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    # ==========================================================================
+    # v3: TRANSITIONS & MOTION
+    # ==========================================================================
+    def _apply_transition(self, all_cuts: bool):
+        if not self.timeline.segments:
+            return
+        self._push_video_undo()
+        tr = {"type": self.cmb_transition.currentData(), "ms": int(self.spn_transition.value() * 1000)}
+        if all_cuts:
+            for s in self.timeline.segments[1:]:
+                s.transition = dict(tr)
+            self.status.showMessage(f"{self.cmb_transition.currentText()} applied to all {len(self.timeline.segments) - 1} cuts.")
+        else:
+            seg = self._get_active_video_segment()
+            if seg is None or seg is self.timeline.segments[0]:
+                self.status.showMessage("Put the playhead on a clip that follows another clip — transitions go between clips.")
+                return
+            seg.transition = dict(tr)
+            self.status.showMessage(f"{self.cmb_transition.currentText()} into this clip.")
+        self.timeline.update()
+        self.chk_output_view.setChecked(True)
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _apply_motion(self):
+        seg = self._get_active_video_segment()
+        if not seg:
+            return
+        self._push_video_undo()
+        seg.motion = {"type": self.cmb_motion.currentData(), "amount": self.spn_motion.value()}
+        self.timeline.update()
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+        self.status.showMessage(f"Motion: {self.cmb_motion.currentText()} on this clip.")
+
+    # ==========================================================================
+    # v3: LAYERS (LOGO / PIP) & MUSIC
+    # ==========================================================================
+    def _refresh_overlay_list(self):
+        self.lst_overlays.blockSignals(True)
+        cur = self.lst_overlays.currentRow()
+        self.lst_overlays.clear()
+        for ov in self.overlays:
+            rng = "whole video" if ov.end_ms is None and ov.start_ms == 0 else f"{format_ms(ov.start_ms)} → {format_ms(ov.end_ms or self.timeline.total_duration_ms())}"
+            self.lst_overlays.addItem(f"{'PiP' if ov.kind == 'video' else 'Logo'}  •  {ov.name}  •  {rng}")
+        self.lst_overlays.setCurrentRow(min(cur, len(self.overlays) - 1) if self.overlays else -1)
+        self.lst_overlays.blockSignals(False)
+        self.timeline.update()
+
+    def _add_overlay(self, kind: str):
+        flt = "Images (*.png *.jpg *.jpeg *.webp *.bmp)" if kind == "image" else "Videos (*.mp4 *.mov *.mkv *.webm *.avi *.m4v)"
+        path, _ = QFileDialog.getOpenFileName(self, "Add Logo / Image" if kind == "image" else "Add Picture-in-Picture Video", "", flt)
+        if not path:
+            return
+        ov = OverlayItem(path)
+        if ov.kind == "image" and ov.image_bgra() is None:
+            QMessageBox.warning(self, "Layer", "Could not read that image.")
+            return
+        if ov.kind == "video":
+            ov.cx, ov.cy, ov.width_pct = 0.78, 0.78, 34.0
+        self._push_video_undo()
+        self.overlays.append(ov)
+        self._refresh_overlay_list()
+        self.lst_overlays.setCurrentRow(len(self.overlays) - 1)
+        self.chk_output_view.setChecked(True)
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _current_overlay(self):
+        i = self.lst_overlays.currentRow()
+        return self.overlays[i] if 0 <= i < len(self.overlays) else None
+
+    def _on_overlay_selected(self, _row):
+        ov = self._current_overlay()
+        if not ov:
+            return
+        for w_ in (self.cmb_ov_pos, self.sl_ov_size, self.sl_ov_opacity):
+            w_.blockSignals(True)
+        pos = min(OverlayItem.POSITIONS.items(), key=lambda kv: abs(kv[1][0] - ov.cx) + abs(kv[1][1] - ov.cy))[0]
+        self.cmb_ov_pos.setCurrentText(pos)
+        self._set_slider_silently(self.sl_ov_size, int(ov.width_pct))
+        self._set_slider_silently(self.sl_ov_opacity, int(ov.opacity * 100))
+        for w_ in (self.cmb_ov_pos, self.sl_ov_size, self.sl_ov_opacity):
+            w_.blockSignals(False)
+
+    def _on_overlay_changed(self, *_):
+        ov = self._current_overlay()
+        if not ov:
+            return
+        ov.cx, ov.cy = OverlayItem.POSITIONS[self.cmb_ov_pos.currentText()]
+        ov.width_pct = float(self.sl_ov_size.value())
+        ov.opacity = self.sl_ov_opacity.value() / 100.0
+        self._mark_dirty()
+        if self.chk_output_view.isChecked():
+            self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _set_overlay_range(self, use_marks: bool):
+        ov = self._current_overlay()
+        if not ov:
+            return
+        if use_marks:
+            marks = self._get_valid_marks()
+            if not marks:
+                return
+            self._push_video_undo()
+            ov.start_ms, ov.end_ms = marks
+        else:
+            self._push_video_undo()
+            ov.start_ms, ov.end_ms = 0, None
+        self._refresh_overlay_list()
+
+    def _remove_overlay(self):
+        i = self.lst_overlays.currentRow()
+        if 0 <= i < len(self.overlays):
+            self._push_video_undo()
+            self.overlays.pop(i)
+            self._refresh_overlay_list()
+            self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _set_music(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Background Music", "",
+                                              "Audio (*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus);;Videos (*.mp4 *.mkv *.webm *.mov)")
+        if not path:
+            return
+        mt = MusicTrack(path)
+        if mt.audio() is None:
+            QMessageBox.warning(self, "Music", "Could not read audio from that file (FFmpeg is needed).")
+            return
+        self._push_video_undo()
+        self.music = mt
+        self._on_music_changed()
+        self._sync_music_ui()
+
+    def _music_to_playhead(self):
+        if self.music:
+            self.music.start_ms = self.timeline.playhead_ms
+            self._sync_music_ui()
+            self._mark_dirty()
+
+    def _remove_music(self):
+        if self.music:
+            self._push_video_undo()
+            self.music = None
+            self._sync_music_ui()
+
+    def _on_music_changed(self):
+        if not self.music:
+            return
+        self.music.volume = self.sl_music_vol.value() / 100.0
+        self.music.duck = self.sl_music_duck.value() / 100.0
+        self.music.loop = self.chk_music_loop.isChecked()
+        self._mark_dirty()
+        self.timeline.update()
+
+    def _sync_music_ui(self):
+        self.timeline.music = self.music
+        if self.music:
+            self.lbl_music.setText(f"{self.music.name}  •  starts {format_ms(self.music.start_ms)}")
+            self._set_slider_silently(self.sl_music_vol, int(self.music.volume * 100))
+            self._set_slider_silently(self.sl_music_duck, int(self.music.duck * 100))
+            self.chk_music_loop.blockSignals(True)
+            self.chk_music_loop.setChecked(self.music.loop)
+            self.chk_music_loop.blockSignals(False)
+        else:
+            self.lbl_music.setText("No music track.")
+        self.timeline.update()
+
+    # ==========================================================================
+    # v3: SUBTITLES (WHISPER) — GENERATE, EDIT, IMPORT/EXPORT, TRANSLATE
+    # ==========================================================================
+    def _on_subtitles_changed(self):
+        self.timeline.subtitles = self.subtitles
+        n = len(self.subtitles)
+        self.lbl_sub_status.setText(f"{n} subtitle line{'s' if n != 1 else ''}." if n else "No subtitles yet.")
+        self.timeline.update()
+        self._mark_dirty()
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _on_sub_style_changed(self):
+        self._mark_dirty()
+        if self.chk_output_view.isChecked():
+            self._render_frame_at_ms(self.timeline.playhead_ms)
+
+    def _generate_subtitles(self):
+        if not self.timeline.segments:
+            QMessageBox.information(self, "Subtitles", "Add a video first.")
+            return
+        if getattr(self, "_sub_job", False):
+            return
+        model = self.cmb_sub_model.currentText().split()[0]
+        lang = self.cmb_sub_lang.currentData()
+        task = "translate" if self.cmb_sub_task.currentIndex() == 1 else "transcribe"
+        segs = [s.clone() for s in self.timeline.segments]
+        self._sub_job = True
+        self.btn_gen_subs.setEnabled(False)
+        self.lbl_sub_status.setText(f"Preparing audio… (first use downloads the '{model}' model once)")
+
+        def work():
+            tmp = os.path.join(tempfile.gettempdir(), f"ank_subs_{os.getpid()}.wav")
             try:
-                res = run_quiet([FFMPEG_EXE, "-hide_banner", "-encoders"], timeout=20)
-                cls._X264 = b"libx264" in res.stdout
+                built = build_timeline_audio(segs, None, keep_pitch=True, sr=16000)
+                if built is None:
+                    raise RuntimeError("The timeline has no sound to transcribe.")
+                write_wav_float(tmp, built[1], built[0])
+                self._bridge.call.emit(lambda: self.lbl_sub_status.setText("Listening… (speech-to-text)"))
+
+                def prog(frac, n):
+                    self._bridge.call.emit(lambda f=frac, k=n: self.lbl_sub_status.setText(f"Listening… {int(f * 100)}%  •  {k} lines"))
+                cues = transcribe_audio(tmp, model, lang, task, progress=prog)
+
+                def done():
+                    self._push_video_undo()
+                    self.subtitles = cues
+                    self._on_subtitles_changed()
+                    self.chk_output_view.setChecked(True)
+                    self.status.showMessage(f"Generated {len(cues)} subtitle lines. Edit them with 'Edit…'.")
+                self._bridge.call.emit(done)
+            except Exception as e:
+                msg = str(e)
+                self._bridge.call.emit(lambda: (self.lbl_sub_status.setText("Subtitle generation failed."),
+                                                QMessageBox.warning(self, "Subtitles", msg)))
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                self._bridge.call.emit(lambda: (setattr(self, "_sub_job", False), self.btn_gen_subs.setEnabled(bool(whisper_engine_name()))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _edit_subtitles(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Subtitles")
+        dlg.resize(760, 520)
+        v = QVBoxLayout(dlg)
+        table = QTableWidget(len(self.subtitles), 3)
+        table.setHorizontalHeaderLabels(["Start", "End", "Text"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setAlternatingRowColors(True)
+        table.setColumnWidth(0, 110)
+        table.setColumnWidth(1, 110)
+        for r, c in enumerate(self.subtitles):
+            for col, val in enumerate((format_ms(c["start"]), format_ms(c["end"]), c["text"].replace("\n", " | "))):
+                table.setItem(r, col, QTableWidgetItem(val))
+        v.addWidget(table)
+
+        def add_row():
+            r = table.rowCount()
+            t = self.timeline.playhead_ms
+            table.insertRow(r)
+            for col, val in enumerate((format_ms(t), format_ms(t + 2000), "New line")):
+                table.setItem(r, col, QTableWidgetItem(val))
+        def del_rows():
+            for r in sorted({i.row() for i in table.selectedIndexes()}, reverse=True):
+                table.removeRow(r)
+        shift = QSpinBox()
+        shift.setRange(-60000, 60000)
+        shift.setSingleStep(100)
+        shift.setSuffix(" ms")
+        def do_shift():
+            for r in range(table.rowCount()):
+                for col in (0, 1):
+                    ms = self._parse_clock(table.item(r, col).text()) + shift.value()
+                    table.item(r, col).setText(format_ms(max(0, ms)))
+        b_add = icon_button("Add at Playhead", "add", "green")
+        b_add.clicked.connect(add_row)
+        b_del = icon_button("Delete Selected", "trash", "red")
+        b_del.clicked.connect(del_rows)
+        b_shift = icon_button("Shift All", "speed", "indigo")
+        b_shift.clicked.connect(do_shift)
+        v.addLayout(self._row(b_add, b_del, None, QLabel("Shift by"), shift, b_shift))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cues = []
+        for r in range(table.rowCount()):
+            try:
+                a = self._parse_clock(table.item(r, 0).text())
+                b = self._parse_clock(table.item(r, 1).text())
+                txt = table.item(r, 2).text().replace(" | ", "\n").strip()
+                if txt and b > a:
+                    cues.append({"start": a, "end": b, "text": txt})
             except Exception:
-                cls._X264 = False
-        return cls._X264
+                continue
+        self._push_video_undo()
+        self.subtitles = sorted(cues, key=lambda c: c["start"])
+        self._on_subtitles_changed()
+
+    @staticmethod
+    def _parse_clock(text: str) -> int:
+        parts = text.strip().replace(",", ".").split(":")
+        sec = float(parts[-1])
+        mins = int(parts[-2]) if len(parts) > 1 else 0
+        hrs = int(parts[-3]) if len(parts) > 2 else 0
+        return int(round((hrs * 3600 + mins * 60 + sec) * 1000))
+
+    def _import_srt(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Subtitles", "", "Subtitles (*.srt *.vtt)")
+        if not path:
+            return
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            cues = parse_srt(re.sub(r"^WEBVTT[^\n]*\n", "", f.read()))
+        if not cues:
+            QMessageBox.warning(self, "Import", "No subtitle lines found in that file.")
+            return
+        self._push_video_undo()
+        self.subtitles = cues
+        self._on_subtitles_changed()
+
+    def _export_srt(self):
+        if not self.subtitles:
+            self.status.showMessage("No subtitles to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Subtitles", "subtitles.srt", "SubRip (*.srt)")
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(subtitles_to_srt(self.subtitles))
+            self.status.showMessage(f"Saved {len(self.subtitles)} lines to {path}")
+
+    def _clear_subtitles(self):
+        if self.subtitles:
+            self._push_video_undo()
+            self.subtitles = []
+            self._on_subtitles_changed()
+
+    def _translate_subtitles(self):
+        if not self.subtitles:
+            self.status.showMessage("Generate or import subtitles first.")
+            return
+        langs = argos_languages()
+        if not langs:
+            QMessageBox.information(
+                self, "Translate Subtitles",
+                "Offline translation uses Argos Translate (free):\n\n    pip install argostranslate\n\n"
+                "then install the language packs you need (for example English → Arabic) with:\n"
+                "    argospm install translate-en_ar\n\n"
+                "Tip: to get English subtitles, choose 'Translate speech to English' and generate again.")
+            return
+        names = [f"{n} ({c})" for c, n in langs]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Translate Subtitles")
+        form = QFormLayout(dlg)
+        src_cb, dst_cb = QComboBox(), QComboBox()
+        src_cb.addItems(names)
+        dst_cb.addItems(names)
+        form.addRow("From", src_cb)
+        form.addRow("To", dst_cb)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            out = self._with_busy("Translating subtitles…", lambda: translate_cues(
+                self.subtitles, langs[src_cb.currentIndex()][0], langs[dst_cb.currentIndex()][0]))
+        except Exception as e:
+            QMessageBox.warning(self, "Translate Subtitles", str(e))
+            return
+        self._push_video_undo()
+        self.subtitles = out
+        self._on_subtitles_changed()
+
+    # ==========================================================================
+    # v3: SMART TOOLS — SCENES, SILENCES, FACES
+    # ==========================================================================
+    def _detect_scenes(self, all_clips: bool):
+        segs = list(self.timeline.segments) if all_clips else [self._get_active_video_segment()]
+        segs = [s for s in segs if s]
+        if not segs:
+            return
+        sens = self.sl_scene_sens.value() / 100.0
+        jobs = [(s, s.source.filepath, s.source.fps, s.in_ms, s.out_ms) for s in segs]
+        self.lbl_smart_status.setText("Looking for scene cuts…")
+
+        def work():
+            found = []
+            for k, (seg, path, fps, a, b) in enumerate(jobs):
+                cuts = detect_scene_cuts(path, fps, a, b, sens, progress=lambda f, k=k: self._bridge.call.emit(
+                    lambda: self.lbl_smart_status.setText(f"Looking for scene cuts… {int((k + f) / len(jobs) * 100)}%")))
+                found.append((seg, cuts))
+
+            def apply():
+                positions = []
+                for seg, cuts in found:
+                    if seg not in self.timeline.segments:
+                        continue
+                    start = self._segment_start_ms(seg)
+                    positions += [start + int((c - seg.in_ms) / seg.speed) for c in cuts if seg.in_ms + 300 < c < seg.out_ms - 300]
+                if not positions:
+                    self.lbl_smart_status.setText("No scene cuts found. Try a higher sensitivity.")
+                    return
+                self._push_video_undo()
+                for pos in sorted(positions, reverse=True):
+                    left, right = self._split_segments_at_ms(self.timeline.segments, pos)
+                    self.timeline.segments = left + right
+                self.timeline.update_width()
+                self.timeline.update()
+                self.lbl_smart_status.setText(f"Split at {len(positions)} scene cut(s).")
+                self.status.showMessage(f"Scene detection: {len(positions)} cut(s) — each scene is now its own clip.")
+            self._bridge.call.emit(apply)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _remove_silences(self):
+        if not self.timeline.segments:
+            return
+        built = self._with_busy("Measuring sound levels…", lambda: build_timeline_audio(self.timeline.segments, None, keep_pitch=False))
+        if built is None:
+            QMessageBox.information(self, "Remove Silences", "The timeline has no sound.")
+            return
+        ranges = detect_silences(built[1], built[0], self.spn_sil_db.value(), int(self.spn_sil_min.value() * 1000))
+        if not ranges:
+            self.lbl_smart_status.setText("No silent gaps found with these settings.")
+            return
+        self._push_video_undo()
+        removed = 0
+        for a, b in sorted(ranges, reverse=True):
+            left, rest = self._split_segments_at_ms(self.timeline.segments, a)
+            _, right = self._split_segments_at_ms(rest, b - a)
+            self.timeline.segments = left + right
+            removed += b - a
+        self.timeline.playhead_ms = min(self.timeline.playhead_ms, self.timeline.total_duration_ms())
+        self.timeline.update_width()
+        self.timeline.update()
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+        msg = f"Removed {len(ranges)} silent gap(s), {removed / 1000:.1f} s in total. Ctrl+Z to undo."
+        self.lbl_smart_status.setText(msg)
+        self.status.showMessage(msg)
+
+    def _analyze_faces(self, then=None):
+        sources = {s.source.source_id: s.source for s in self.timeline.segments}
+        todo = [src for src in sources.values() if src.face_track is None]
+        if not todo:
+            self.lbl_smart_status.setText("Faces already analysed — choose 'Smart reframe' framing when exporting.")
+            if then:
+                then()
+            return
+        self.lbl_smart_status.setText("Analysing faces…")
+
+        def work():
+            for k, src in enumerate(todo):
+                self._bridge.call.emit(lambda k=k, n=src.filename: self.lbl_smart_status.setText(f"Analysing faces in {n} ({k + 1}/{len(todo)})…"))
+                src.face_track = compute_face_track(src.filepath, src.fps, src.duration_ms)
+
+            def done():
+                self.lbl_smart_status.setText("Faces analysed. Smart reframe will follow the speaker.")
+                self.cmb_exp_fit.setCurrentIndex(3)
+                if then:
+                    then()
+                self._render_frame_at_ms(self.timeline.playhead_ms)
+            self._bridge.call.emit(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ==========================================================================
+    # v3: PROXIES & TIMELINE THUMBNAILS (background)
+    # ==========================================================================
+    def _make_proxy_async(self, src: VideoSource):
+        if not FFMPEG_EXE or max(src.width, src.height) <= 1920:
+            return
+        out = os.path.join(cache_dir(), f"proxy_{abs(hash((src.filepath, os.path.getsize(src.filepath))))}.mp4")
+
+        def work():
+            if not os.path.exists(out):
+                tmp = out + ".part.mp4"
+                res = run_quiet([FFMPEG_EXE, "-y", "-i", src.filepath, "-vf", "scale=-2:540", "-c:v", "libx264",
+                                 "-preset", "ultrafast", "-crf", "28", "-g", "12", "-an", tmp])
+                if res.returncode != 0:
+                    return
+                os.replace(tmp, out)
+
+            def done():
+                src.proxy_path = out
+                old = self.open_captures.get(src.source_id)
+                self.open_captures[src.source_id] = FrameReader(out, src.fps)
+                if old:
+                    old.release()
+                self.status.showMessage(f"Fast preview ready for {src.filename} (4K edit proxy). Exports still use the original.")
+            self._bridge.call.emit(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _make_thumbs_async(self, src: VideoSource):
+        def work():
+            reader = FrameReader(src.filepath, src.fps)
+            step = max(500, src.duration_ms // 240)
+            thumbs = []
+            t = 0
+            while t < src.duration_ms:
+                fr = reader.frame_at_ms(t)
+                if fr is None:
+                    break
+                h, w = fr.shape[:2]
+                th = 46
+                tw = max(1, int(w * th / h))
+                thumbs.append((t, np.ascontiguousarray(cv2.cvtColor(cv2.resize(fr, (tw, th), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB))))
+                t += step
+            reader.release()
+            src.thumbs = thumbs
+            self._bridge.call.emit(self.timeline.update)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ==========================================================================
+    # v3: EXPORT QUEUE (BACKGROUND, GPU ENCODING, PLATFORM PRESETS)
+    # ==========================================================================
+    def _on_platform_preset(self, idx: int):
+        title, size, fps, fit, limit = OUTPUT_PRESETS[idx]
+        if size:
+            sizes = [None, (1920, 1080), (1280, 720), (1080, 1920), (1080, 1080), (1080, 1350), (3840, 2160)]
+            if size in sizes:
+                self.cmb_exp_format.setCurrentIndex(sizes.index(size))
+            self.cmb_exp_fps.setCurrentText(str(fps) if fps else "Source FPS")
+            self.cmb_exp_fit.setCurrentIndex({"blur": 0, "fit": 1, "fill": 2, "smart": 3}[fit])
+        self._update_export_warning()
+
+    def _update_export_warning(self):
+        idx = self.cmb_exp_platform.currentIndex()
+        limit = OUTPUT_PRESETS[idx][4] if 0 <= idx < len(OUTPUT_PRESETS) else None
+        total = self.timeline.total_duration_ms() / 1000.0
+        if limit and total > limit:
+            self.lbl_exp_warning.setText(f"Heads up: your video is {total / 60:.1f} min. {OUTPUT_PRESETS[idx][0].split('(')[0].strip()} "
+                                         f"usually allows up to {limit // 60 if limit >= 60 else limit} {'min' if limit >= 60 else 's'}.")
+        else:
+            self.lbl_exp_warning.setText("")
+
+    def _detect_encoders_async(self):
+        def work():
+            encs = available_encoders()
+
+            def done():
+                gpu = [e for e in encs if e != "libx264"]
+                names = {"h264_nvenc": "NVIDIA", "h264_qsv": "Intel QuickSync", "h264_amf": "AMD"}
+                self.lbl_encoders.setText(("GPU encoding available: " + ", ".join(names[e] for e in gpu) + " — Auto will use it.")
+                                          if gpu else ("No GPU encoder found — using CPU (x264)." if encs else "FFmpeg not found — install it for H.264 export."))
+                model = self.cmb_exp_encoder.model()
+                for i in range(self.cmb_exp_encoder.count()):
+                    key = self.cmb_exp_encoder.itemData(i)
+                    item = model.item(i)
+                    item.setEnabled(key == "auto" or key in encs)
+            self._bridge.call.emit(done)
+        threading.Thread(target=work, daemon=True).start()
 
     def _export_timeline_video(self):
         if not self.timeline.segments:
             QMessageBox.warning(self, "Empty Timeline", "Add or drag-and-drop at least one video first.")
             return
-        if self.is_playing:
-            self._toggle_playback()
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Edited Video", "ank_output.mp4", "MP4 Video (*.mp4)")
         if not out_path:
             return
         if not out_path.lower().endswith(".mp4"):
             out_path += ".mp4"
+        out_w, out_h, fps, fit = self._export_target()
+        job = {
+            "id": len(self.export_jobs) + 1, "out": out_path, "w": out_w, "h": out_h, "fps": fps, "fit": fit,
+            "crf": (16, 19, 23, 28)[self.cmb_exp_quality.currentIndex()],
+            "encoder": self.cmb_exp_encoder.currentData(), "keep_pitch": self.chk_exp_pitch.isChecked(),
+            "segments": [s.clone() for s in self.timeline.segments], "overlays": [o.clone() for o in self.overlays],
+            "subtitles": [dict(c) for c in self.subtitles], "sub_style": self._sub_style_overlay(),
+            "burn": self.chk_sub_burn.isChecked(), "music": self.music.clone() if self.music else None,
+            "status": "Queued", "progress": 0.0, "cancel": False, "error": "", "encoder_used": "",
+        }
+        self.export_jobs.append(job)
+        self.video_inspector.setCurrentIndex(self.video_inspector.count() - 1)
+        self._refresh_export_list()
+        self.status.showMessage(f"Export #{job['id']} queued — it renders in the background, keep editing.")
+        if not self._export_worker_busy:
+            self._export_worker_busy = True
+            threading.Thread(target=self._export_worker, daemon=True).start()
 
-        first = self.timeline.segments[0].source
-        presets = [None, (1920, 1080), (1280, 720), (1080, 1920), (1080, 1080), (1080, 1350), (3840, 2160)]
-        size = presets[self.cmb_exp_format.currentIndex()] or (first.width or 1280, first.height or 720)
-        out_w, out_h = size[0] // 2 * 2, size[1] // 2 * 2
-        fit_mode = ("blur", "fit", "fill")[self.cmb_exp_fit.currentIndex()]
-        fps_txt = self.cmb_exp_fps.currentText()
-        fps = round(first.fps, 3) if fps_txt.startswith("Source") else float(fps_txt)
-        fps = max(10.0, min(120.0, fps))
-        crf = (16, 19, 23, 28)[self.cmb_exp_quality.currentIndex()]
-        keep_pitch = self.chk_exp_pitch.isChecked()
+    def _refresh_export_list(self):
+        sel = self.lst_exports.currentRow()
+        self.lst_exports.clear()
+        for j in self.export_jobs:
+            pct = f" {int(j['progress'] * 100)}%" if j["status"].startswith("Rendering") else ""
+            enc = f"  [{j['encoder_used']}]" if j["encoder_used"] else ""
+            self.lst_exports.addItem(f"#{j['id']}  {os.path.basename(j['out'])}  —  {j['status']}{pct}{enc}")
+        if 0 <= sel < self.lst_exports.count():
+            self.lst_exports.setCurrentRow(sel)
 
-        frames_per_seg = [max(1, int(round(seg.duration_ms * fps / 1000.0))) for seg in self.timeline.segments]
-        total_frames = sum(frames_per_seg)
-        prog = QProgressDialog("Mixing audio…", "Cancel", 0, total_frames + 1, self)
-        prog.setWindowTitle(f"Exporting — {APP_NAME}")
-        prog.setWindowModality(Qt.WindowModality.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setValue(0)
-        QApplication.processEvents()
+    def _cancel_selected_export(self):
+        i = self.lst_exports.currentRow()
+        if not 0 <= i < len(self.export_jobs):
+            return
+        job = self.export_jobs[i]
+        if job["status"] in ("Done", "Failed", "Cancelled"):
+            return
+        job["cancel"] = True
+        if job["status"] == "Queued":
+            job["status"] = "Cancelled"
+        self._refresh_export_list()
 
-        tmp_dir = tempfile.mkdtemp(prefix="ank_export_")
-        tmp_wav = os.path.join(tmp_dir, "mix.wav")
-        proc = None
-        writer = None
-        err_log = os.path.join(tmp_dir, "ffmpeg.log")
-        cancelled = False
+    def _open_export_folder(self):
+        done = [j for j in self.export_jobs if j["status"] == "Done"]
+        folder = os.path.dirname(done[-1]["out"]) if done else os.path.expanduser("~")
+        if os.name == "nt":
+            os.startfile(folder)
+        else:
+            subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", folder])
+
+    def _export_worker(self):
         try:
-            has_audio = self._build_mixed_timeline_wav(tmp_wav, keep_pitch=keep_pitch)
-            prog.setLabelText("Rendering video…")
-            if FFMPEG_EXE:
-                vcodec = ["-c:v", "libx264", "-preset", "faster", "-crf", str(crf), "-pix_fmt", "yuv420p"] if self._has_x264() \
-                    else ["-c:v", "mpeg4", "-q:v", "3"]
-                cmd = [FFMPEG_EXE, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-"]
-                if has_audio:
-                    cmd += ["-i", tmp_wav, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]
-                cmd += vcodec + ["-movflags", "+faststart", out_path]
-                with open(err_log, "wb") as log_f:
-                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log_f, creationflags=NO_WINDOW)
-            else:
-                writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
-
-            readers = {}
-            done = 0
-            for seg, n_frames in zip(self.timeline.segments, frames_per_seg):
-                src = seg.source
-                reader = readers.get(src.source_id) or FrameReader(src.filepath, src.fps)
-                readers[src.source_id] = reader
-                has_fades = seg.fade_in_ms > 0 or seg.fade_out_ms > 0
-                last_idx, last_out = None, None
-                for i in range(n_frames):
-                    local_ms = i * 1000.0 / fps
-                    src_ms = min(seg.out_ms - 1, seg.in_ms + local_ms * seg.speed)
-                    frame = reader.frame_at_ms(src_ms)
-                    if frame is None:
-                        out = last_out if last_out is not None else np.zeros((out_h, out_w, 3), np.uint8)
-                    elif reader.last_idx == last_idx and last_out is not None and not has_fades:
-                        out = last_out   # slow-motion: same source frame, reuse the rendered result
-                    else:
-                        processed = self._process_video_frame(frame, seg, (src.width, src.height), preview_mode=False, local_ms=local_ms)
-                        out = np.ascontiguousarray(fit_into_frame(processed, out_w, out_h, fit_mode))
-                    last_idx, last_out = reader.last_idx, out
-                    if proc:
-                        proc.stdin.write(out.tobytes())
-                    else:
-                        writer.write(out)
-                    done += 1
-                    if done % 5 == 0:
-                        prog.setValue(done)
-                        prog.setLabelText(f"Rendering video…  frame {done} / {total_frames}")
-                        QApplication.processEvents()
-                        if prog.wasCanceled():
-                            cancelled = True
-                            break
-                if cancelled:
+            while True:
+                job = next((j for j in self.export_jobs if j["status"] == "Queued"), None)
+                if job is None:
                     break
-            for r in readers.values():
-                r.release()
-
-            if proc:
-                proc.stdin.close()
-                if cancelled:
-                    proc.kill()
-                proc.wait()
-                if not cancelled and proc.returncode != 0:
-                    with open(err_log, "rb") as f:
-                        tail = f.read()[-1500:].decode("utf-8", "ignore")
-                    raise RuntimeError(f"FFmpeg failed (code {proc.returncode}):\n{tail}")
-            elif writer:
-                writer.release()
-            prog.setValue(total_frames + 1)
-
-            if cancelled:
                 try:
-                    os.remove(out_path)
+                    self._run_export_job(job)
+                except Exception as e:
+                    job["status"] = "Failed"
+                    job["error"] = str(e)
+                    err = str(e)
+                    self._bridge.call.emit(lambda j=job, m=err: QMessageBox.critical(self, f"Export #{j['id']} failed", m))
+                self._bridge.call.emit(self._refresh_export_list)
+        finally:
+            self._export_worker_busy = False
+            # A job queued at the very last moment still gets rendered
+            if any(j["status"] == "Queued" for j in self.export_jobs):
+                self._export_worker_busy = True
+                threading.Thread(target=self._export_worker, daemon=True).start()
+
+    def _run_export_job(self, job):
+        def ui():
+            self._bridge.call.emit(self._refresh_export_list)
+        segs = job["segments"]
+        if job["fit"] == "smart":
+            job["status"] = "Analysing faces"
+            ui()
+            for src in {s.source.source_id: s.source for s in segs}.values():
+                if src.face_track is None:
+                    src.face_track = compute_face_track(src.filepath, src.fps, src.duration_ms, cancel=lambda: job["cancel"])
+        job["status"] = "Mixing audio"
+        ui()
+        tmp_dir = tempfile.mkdtemp(prefix="ank_export_")
+        wav = os.path.join(tmp_dir, "mix.wav")
+        built = build_timeline_audio(segs, job["music"], keep_pitch=job["keep_pitch"])
+        if built is not None:
+            write_wav_float(wav, built[1], built[0])
+        ctx = RenderContext(segs, job["overlays"], job["subtitles"], job["sub_style"], job["burn"],
+                            job["w"], job["h"], job["fit"], preview=False)
+        fps = job["fps"]
+        total_frames = max(1, int(round(ctx.total * fps / 1000.0)))
+        enc = pick_encoder(job["encoder"]) if FFMPEG_EXE else ""
+        attempts = [enc] + (["libx264"] if enc not in ("libx264", "mpeg4", "") else [])
+        try:
+            for attempt, enc in enumerate(attempts):
+                job["encoder_used"] = {"h264_nvenc": "NVIDIA GPU", "h264_qsv": "Intel GPU", "h264_amf": "AMD GPU",
+                                       "libx264": "CPU x264", "mpeg4": "MPEG-4", "": "OpenCV"}.get(enc, enc)
+                job["status"] = "Rendering"
+                job["progress"] = 0.0
+                ui()
+                ok = self._encode_frames(job, ctx, enc, wav if built is not None else None, total_frames, tmp_dir)
+                if ok or job["cancel"]:
+                    break
+            if job["cancel"]:
+                job["status"] = "Cancelled"
+                try:
+                    os.remove(job["out"])
                 except OSError:
                     pass
-                self.status.showMessage("Export cancelled.")
                 return
-            size_mb = os.path.getsize(out_path) / (1024 * 1024)
-            QMessageBox.information(
-                self, "Export Complete",
-                f"Video exported successfully:\n{out_path}\n\n{out_w}×{out_h} @ {fps:g} fps  •  {size_mb:.1f} MB"
-                f"{'' if has_audio else '  •  (no audio in the timeline)'}\n\n{APP_NAME} v{APP_VERSION} — Created by {APP_AUTHOR}"
-            )
-            self.status.showMessage(f"Exported final video: {out_path}")
-        except Exception as e:
-            if proc and proc.poll() is None:
-                proc.kill()
-            QMessageBox.critical(self, "Export Error", str(e))
+            if not ok:
+                raise RuntimeError(job.get("error") or "Encoding failed.")
+            job["status"] = "Done"
+            job["progress"] = 1.0
+            size_mb = os.path.getsize(job["out"]) / (1024 * 1024)
+            self._bridge.call.emit(lambda: self.status.showMessage(
+                f"Export #{job['id']} finished: {job['out']}  ({job['w']}×{job['h']}, {size_mb:.1f} MB, {job['encoder_used']})"))
         finally:
-            prog.close()
+            ctx.release()
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _encode_frames(self, job, ctx, enc, wav, total_frames, tmp_dir) -> bool:
+        w, h, fps = job["w"], job["h"], job["fps"]
+        proc = writer = None
+        log_path = os.path.join(tmp_dir, f"ffmpeg_{enc or 'cv'}.log")
+        if enc:
+            cmd = [FFMPEG_EXE, "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-"]
+            if wav:
+                cmd += ["-i", wav, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+            cmd += encoder_args(enc, job["crf"]) + ["-movflags", "+faststart", job["out"]]
+            log_f = open(log_path, "wb")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log_f, creationflags=NO_WINDOW)
+        else:
+            writer = cv2.VideoWriter(job["out"], cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        try:
+            for k in range(total_frames):
+                if job["cancel"]:
+                    break
+                img = ctx.frame_at(k * 1000.0 / fps)
+                if img.shape[1] != w or img.shape[0] != h:
+                    img = cv2.resize(img, (w, h))
+                if proc:
+                    proc.stdin.write(np.ascontiguousarray(img).tobytes())
+                else:
+                    writer.write(img)
+                if k % 10 == 0:
+                    job["progress"] = k / total_frames
+                    if k % 30 == 0:
+                        self._bridge.call.emit(self._refresh_export_list)
+            if proc:
+                proc.stdin.close()
+                if job["cancel"]:
+                    proc.kill()
+                proc.wait()
+                if proc.returncode != 0 and not job["cancel"]:
+                    log_f.close()
+                    with open(log_path, "rb") as f:
+                        job["error"] = f"FFmpeg ({enc}) failed:\n" + f.read()[-1200:].decode("utf-8", "ignore")
+                    return False
+            return True
+        except (BrokenPipeError, OSError) as e:
+            if proc:
+                proc.kill()
+                proc.wait()
+            job["error"] = f"Encoder {enc} stopped: {e}"
+            return False
+        finally:
+            if writer:
+                writer.release()
+            if proc:
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+
+
+    # ==========================================================================
+    # v3: PROJECTS (.ank) — SAVE / OPEN / RECENT, AUTOSAVE & CRASH RECOVERY
+    # ==========================================================================
+    @staticmethod
+    def _autosave_path() -> str:
+        return os.path.join(cache_dir(), "autosave.ank")
+
+    def _update_title(self):
+        name = os.path.basename(self.project_path) if self.project_path else "Untitled project"
+        self.setWindowTitle(f"{'• ' if self._dirty else ''}{name} — {APP_NAME} v{APP_VERSION} — Created by {APP_AUTHOR}")
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._update_title()
+
+    def _project_dict(self) -> dict:
+        def tf_dict(tf):
+            return {"rot": tf.rot_90_steps, "angle": tf.free_angle, "flip_h": tf.flip_h, "flip_v": tf.flip_v,
+                    "scale": tf.scale, "ox": tf.offset_x, "oy": tf.offset_y, "ai": tf.ai_upscale,
+                    "cutout": tf.transparent_bg, "bg_path": getattr(tf, "bg_path", None)}
+        sources = {}
+        segs = []
+        for s in self.timeline.segments:
+            sources[s.source.source_id] = s.source
+            am = s.audio_mix
+            segs.append({
+                "source": s.source.source_id, "in": s.in_ms, "out": s.out_ms, "crop": list(s.crop_rect) if s.crop_rect else None,
+                "transform": tf_dict(s.transform), "speed": s.speed,
+                "audio": {"separated": am.separated, "voices": am.voices_vol, "music": am.music_vol, "noise": am.noise_vol,
+                          "gain": am.gain, "fade_in": am.fade_in_ms, "fade_out": am.fade_out_ms,
+                          "trim_start": am.stem_trim_start, "trim_end": am.stem_trim_end},
+                "color": {**{f: getattr(s.color, f) for f in ColorParams.FIELDS}, "filter": s.color.filter},
+                "text": dict(s.text.__dict__), "fade_in": s.fade_in_ms, "fade_out": s.fade_out_ms,
+                "transition": s.transition, "motion": s.motion,
+            })
+        return {
+            "app": APP_NAME, "app_version": APP_VERSION, "project_version": 3,
+            "sources": [{"id": src.source_id, "path": src.filepath, "color": src.color,
+                         "stems": src.stems_engine if src.stems_separated else ""} for src in sources.values()],
+            "segments": segs,
+            "overlays": [o.to_dict() for o in self.overlays],
+            "music": self.music.to_dict() if self.music else None,
+            "subtitles": self.subtitles,
+            "sub_style": {"size": self.spn_sub_size.value(), "pos": self.cmb_sub_pos.currentIndex(),
+                          "color": getattr(self.btn_sub_color, "_color", "#FFFFFF"), "backdrop": self.chk_sub_backdrop.isChecked(),
+                          "burn": self.chk_sub_burn.isChecked()},
+            "marks": {"a": self.timeline.mark_a_ms, "b": self.timeline.mark_b_ms, "lock_a": self.timeline.lock_a, "lock_b": self.timeline.lock_b},
+            "playhead": self.timeline.playhead_ms,
+            "export": {"platform": self.cmb_exp_platform.currentIndex(), "format": self.cmb_exp_format.currentIndex(),
+                       "fit": self.cmb_exp_fit.currentIndex(), "fps": self.cmb_exp_fps.currentIndex(),
+                       "quality": self.cmb_exp_quality.currentIndex(), "encoder": self.cmb_exp_encoder.currentIndex()},
+        }
+
+    def _write_project(self, path: str, data: dict = None):
+        data = data or self._project_dict()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)   # never leaves a half-written project behind
+
+    def _clear_legend(self):
+        lay = self.sources_legend_layout
+        for i in reversed(range(1, lay.count() - 1)):
+            item = lay.takeAt(i)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _reset_video_project(self):
+        if self.is_playing:
+            self._toggle_playback()
+        for r in self.open_captures.values():
+            r.release()
+        self.open_captures.clear()
+        self.video_sources = []
+        self.timeline.segments = []
+        self.timeline.mark_a_ms = self.timeline.mark_b_ms = None
+        self.timeline.lock_a = self.timeline.lock_b = False
+        for name in ("A", "B"):
+            btn = self.btn_lock_a if name == "A" else self.btn_lock_b
+            btn.setChecked(False)
+            btn.setText(f"Lock {name}")
+            btn.setIcon(make_icon("unlock", "cyan" if name == "A" else "rose"))
+        self.timeline.playhead_ms = 0
+        self.overlays.clear()
+        self.music = None
+        self.subtitles = []
+        self.video_undo_stack.clear()
+        self.video_redo_stack.clear()
+        self.clipboard_segments = []
+        self._clear_legend()
+        self._refresh_overlay_list()
+        self._sync_music_ui()
+        self.timeline.subtitles = self.subtitles
+        self._on_subtitles_changed()
+        self._update_marks_label(None, None)
+        self.timeline.update_width()
+        self.timeline.update()
+        self.video_Canvas.clear_image()
+        self.lbl_time_counter.setText("00:00.000 / 00:00.000")
+
+    def _confirm_discard(self) -> bool:
+        """True when it's OK to replace the current project (saving first if the user wants)."""
+        if not self._dirty or not self.timeline.segments:
+            return True
+        ans = QMessageBox.question(self, APP_NAME, "Save changes to the current project first?",
+                                   QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
+        if ans == QMessageBox.StandardButton.Save:
+            return self._save_project()
+        return ans == QMessageBox.StandardButton.Discard
+
+    def _new_project(self):
+        if not self._confirm_discard():
+            return
+        self._reset_video_project()
+        self.project_path = ""
+        self._dirty = False
+        self._update_title()
+        self.status.showMessage("New project.")
+
+    def _save_project(self, save_as: bool = False) -> bool:
+        if not self.timeline.segments:
+            self.status.showMessage("Nothing to save yet — add a video first.")
+            return False
+        path = self.project_path
+        if save_as or not path:
+            path, _ = QFileDialog.getSaveFileName(self, "Save Project", path or "my_edit.ank", "ANK Project (*.ank)")
+            if not path:
+                return False
+            if not path.lower().endswith(".ank"):
+                path += ".ank"
+        try:
+            self._write_project(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Project", f"Could not save the project:\n{e}")
+            return False
+        self.project_path = path
+        self._dirty = False
+        self._add_recent(path)
+        self._update_title()
+        self.status.showMessage(f"Project saved: {path}")
+        return True
+
+    def _open_project(self, path: str = None):
+        if not self._confirm_discard():
+            return
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "ANK Project (*.ank)")
+            if not path:
+                return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Project", f"Could not open the project:\n{e}")
+            return
+        self._load_project_dict(data, os.path.dirname(path))
+        self.project_path = path if not path.endswith("autosave.ank") else ""
+        self._dirty = False
+        if self.project_path:
+            self._add_recent(path)
+        self._update_title()
+
+    def _load_project_dict(self, data: dict, base_dir: str = ""):
+        self.tabs.setCurrentIndex(0)
+        self._reset_video_project()
+        id_map, missing = {}, []
+        for sd in data.get("sources", []):
+            p = sd["path"]
+            if not os.path.exists(p):
+                alt = os.path.join(base_dir, os.path.basename(p))
+                p = alt if os.path.exists(alt) else p
+            if not os.path.exists(p):
+                missing.append(sd["path"])
+                continue
+            src = VideoSource(len(self.video_sources) + 1, p, sd.get("color") or VIDEO_PALETTE[len(self.video_sources) % len(VIDEO_PALETTE)])
+            if src.duration_ms <= 0:
+                missing.append(sd["path"])
+                continue
+            self.video_sources.append(src)
+            self.open_captures[src.source_id] = FrameReader(p, src.fps)
+            id_map[sd["id"]] = (src, sd.get("stems", ""))
+            badge = QLabel(f" V{src.source_id}  {src.filename} ")
+            c = QColor(src.color)
+            badge.setStyleSheet(f"background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c.lighter(130).name()}, "
+                                f"stop:1 {c.darker(140).name()}); color: white; font-weight: bold; padding: 3px 9px; "
+                                f"border-radius: 7px; border: 1px solid {c.lighter(160).name()};")
+            self.sources_legend_layout.insertWidget(self.sources_legend_layout.count() - 1, badge)
+            self._load_source_audio_async(src)
+            self._make_thumbs_async(src)
+            self._make_proxy_async(src)
+        segs = []
+        for sd in data.get("segments", []):
+            if sd["source"] not in id_map:
+                continue
+            src = id_map[sd["source"]][0]
+            seg = TimelineSegment(src, sd["in"], min(sd["out"], src.duration_ms), tuple(sd["crop"]) if sd.get("crop") else None,
+                                  speed=sd.get("speed", 1.0), fade_in_ms=sd.get("fade_in", 0), fade_out_ms=sd.get("fade_out", 0),
+                                  transition=sd.get("transition"), motion=sd.get("motion"))
+            t = sd.get("transform", {})
+            tf = seg.transform
+            tf.rot_90_steps, tf.free_angle = t.get("rot", 0), t.get("angle", 0.0)
+            tf.flip_h, tf.flip_v, tf.scale = t.get("flip_h", False), t.get("flip_v", False), t.get("scale", 1.0)
+            tf.offset_x, tf.offset_y = t.get("ox", 0), t.get("oy", 0)
+            tf.ai_upscale, tf.transparent_bg = t.get("ai", False), t.get("cutout", False)
+            if t.get("bg_path") and os.path.exists(t["bg_path"]):
+                tf.bg_replacement = cv2.imdecode(np.fromfile(t["bg_path"], dtype=np.uint8), cv2.IMREAD_COLOR)
+                tf.bg_path = t["bg_path"]
+            a = sd.get("audio", {})
+            am = seg.audio_mix
+            am.separated = a.get("separated", False)
+            am.voices_vol, am.music_vol, am.noise_vol = a.get("voices", 1.0), a.get("music", 1.0), a.get("noise", 1.0)
+            am.gain, am.fade_in_ms, am.fade_out_ms = a.get("gain", 1.0), a.get("fade_in", 0), a.get("fade_out", 0)
+            am.stem_trim_start.update(a.get("trim_start", {}))
+            am.stem_trim_end.update(a.get("trim_end", {}))
+            for f in ColorParams.FIELDS:
+                setattr(seg.color, f, sd.get("color", {}).get(f, 0))
+            seg.color.filter = sd.get("color", {}).get("filter", "none")
+            seg.text.__dict__.update(sd.get("text", {}))
+            seg._clamp_stem_trims()
+            segs.append(seg)
+        self.timeline.segments = segs
+        self.overlays.extend(OverlayItem.from_dict(o) for o in data.get("overlays", []) if os.path.exists(o.get("path", "")))
+        md = data.get("music")
+        self.music = MusicTrack.from_dict(md) if md and os.path.exists(md.get("path", "")) else None
+        self.subtitles = list(data.get("subtitles", []))
+        st = data.get("sub_style", {})
+        self.spn_sub_size.setValue(st.get("size", 5))
+        self.cmb_sub_pos.setCurrentIndex(st.get("pos", 0))
+        self._set_color_button(self.btn_sub_color, st.get("color", "#FFFFFF"))
+        self.chk_sub_backdrop.setChecked(st.get("backdrop", True))
+        self.chk_sub_burn.setChecked(st.get("burn", True))
+        ex = data.get("export", {})
+        for cb, key in ((self.cmb_exp_platform, "platform"), (self.cmb_exp_format, "format"), (self.cmb_exp_fit, "fit"),
+                        (self.cmb_exp_fps, "fps"), (self.cmb_exp_quality, "quality"), (self.cmb_exp_encoder, "encoder")):
+            if key in ex and 0 <= ex[key] < cb.count():
+                cb.blockSignals(True)
+                cb.setCurrentIndex(ex[key])
+                cb.blockSignals(False)
+        mk = data.get("marks", {})
+        self.timeline.mark_a_ms, self.timeline.mark_b_ms = mk.get("a"), mk.get("b")
+        for name, locked in (("A", mk.get("lock_a")), ("B", mk.get("lock_b"))):
+            if locked:
+                self._toggle_mark_lock(name, True)
+        self._refresh_overlay_list()
+        self._sync_music_ui()
+        self._on_subtitles_changed()
+        self.timeline.playhead_ms = min(data.get("playhead", 0), self.timeline.total_duration_ms())
+        self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
+        self.timeline.update_width()
+        self.timeline.update()
+        self._render_frame_at_ms(self.timeline.playhead_ms)
+        # Separated stems are recomputed in the background with the same engine as before
+        for src, engine in id_map.values():
+            if engine and any(s.source is src and s.audio_mix.separated for s in segs):
+                self._resume_separation(src, engine)
+        if missing:
+            QMessageBox.warning(self, "Missing media", "These files could not be found and were left out:\n\n" + "\n".join(missing))
+        self.status.showMessage(f"Opened project with {len(segs)} clip(s).")
+
+    def _resume_separation(self, src, engine):
+        idx = self.cmb_sep_engine.findData(engine)
+        if idx >= 0 and self.cmb_sep_engine.model().item(idx).isEnabled():
+            self.cmb_sep_engine.setCurrentIndex(idx)
+        playhead = self.timeline.playhead_ms
+        seg = next((s for s in self.timeline.segments if s.source is src), None)
+        if seg:
+            self.timeline.playhead_ms = self._segment_start_ms(seg) + 1
+            self._separate_audio_for_active_clip()
+            self.timeline.playhead_ms = playhead
+
+    def _add_recent(self, path: str):
+        rec = [p for p in (self.settings.value("recent", []) or []) if p != path]
+        rec.insert(0, path)
+        self.settings.setValue("recent", rec[:8])
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        if not hasattr(self, "menu_recent"):
+            return
+        self.menu_recent.clear()
+        rec = [p for p in (self.settings.value("recent", []) or []) if isinstance(p, str)]
+        for p in rec:
+            act = self.menu_recent.addAction(os.path.basename(p))
+            act.setToolTip(p)
+            act.triggered.connect(lambda _=False, pp=p: self._open_project(pp))
+        if not rec:
+            a = self.menu_recent.addAction("(no recent projects)")
+            a.setEnabled(False)
+
+    def _autosave(self):
+        if not self._dirty or not self.timeline.segments:
+            return
+        try:
+            data = self._project_dict()
+            data["autosave_of"] = self.project_path
+            self._write_project(self._autosave_path(), data)
+        except Exception:
+            pass
+
+    def _offer_recovery(self):
+        path = self._autosave_path()
+        crashed = str(self.settings.value("clean_exit", "true")).lower() != "true"
+        self.settings.setValue("clean_exit", "false")
+        if crashed and os.path.exists(path):
+            ans = QMessageBox.question(self, "Recover your work?",
+                                       "ANK Media Studio did not close normally last time.\n\nRestore the automatically saved edit?",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ans == QMessageBox.StandardButton.Yes:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self._load_project_dict(data, os.path.dirname(data.get("autosave_of") or path))
+                self.project_path = data.get("autosave_of") or ""
+                self._mark_dirty()
+                self.status.showMessage("Recovered your last session from the autosave.")
+
+    def _save_shortcut(self):
+        if self.tabs.currentIndex() == 0:
+            self._save_project()
+        elif self.tabs.currentIndex() == 1:
+            self._save_photo(transparent_png=False)
+
+
+    # ==========================================================================
+    # v3: TAB 3 — DOWNLOAD (yt-dlp) + NADER DOWNLOADER INTEGRATION
+    # ==========================================================================
+    def _build_download_tab(self):
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        left = QFrame()
+        left.setObjectName("Card")
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("Download a video, then edit it here")
+        title.setObjectName("Section")
+        title.setStyleSheet("font-size: 15px;")
+        lv.addWidget(title)
+        self.txt_dl_url = QLineEdit()
+        self.txt_dl_url.setPlaceholderText("Paste a video link (YouTube, TikTok, Instagram, Dailymotion, …)")
+        btn_paste = icon_button("Paste", "paste", "sky")
+        btn_paste.clicked.connect(lambda: self.txt_dl_url.setText(QApplication.clipboard().text().strip()))
+        lv.addLayout(self._row(self.txt_dl_url, btn_paste))
+        self.cmb_dl_quality = QComboBox()
+        self.cmb_dl_quality.addItems(["Best quality (MP4)", "1080p (MP4)", "720p (MP4)", "Audio only (MP3)"])
+        self.chk_dl_open = QCheckBox("Open in the Video Studio when finished")
+        self.chk_dl_open.setChecked(True)
+        lv.addLayout(self._row(QLabel("Quality"), self.cmb_dl_quality, self.chk_dl_open, None))
+        self.btn_dl_start = icon_button("Download", "export", "green", kind="success")
+        self.btn_dl_start.setMinimumHeight(38)
+        self.btn_dl_start.clicked.connect(self._start_download)
+        self.btn_dl_stop = icon_button("Stop", "stop", "red")
+        self.btn_dl_stop.setEnabled(False)
+        self.btn_dl_stop.clicked.connect(self._stop_download)
+        lv.addLayout(self._row(self.btn_dl_start, self.btn_dl_stop))
+        self.dl_progress = QProgressBar()
+        self.dl_progress.setRange(0, 100)
+        self.dl_progress.setValue(0)
+        lv.addWidget(self.dl_progress)
+        self.lbl_dl_status = self._muted("Ready." if ytdlp_command() else "yt-dlp not found. Install it with:  pip install yt-dlp")
+        lv.addWidget(self.lbl_dl_status)
+
+        lv.addWidget(self._section("Save downloads to"))
+        self.txt_dl_dir = QLineEdit(str(self.settings.value("download_dir", os.path.join(os.path.expanduser("~"), "Videos", "ANK Downloads"))))
+        btn_dir = icon_button("", "open", "amber", "Choose folder")
+        btn_dir.clicked.connect(lambda: self._choose_dir(self.txt_dl_dir, "download_dir"))
+        lv.addLayout(self._row(self.txt_dl_dir, btn_dir, stretch_last=False))
+
+        lv.addWidget(self._section("Nader Downloader (Narto, Shortmax, TikTok bulk…)"))
+        self.txt_nd_path = QLineEdit(self._find_nader_downloader())
+        self.txt_nd_path.setPlaceholderText("Path to Downloader.py")
+        btn_nd_browse = icon_button("", "open", "amber", "Find Downloader.py")
+        btn_nd_browse.clicked.connect(self._browse_nader_downloader)
+        lv.addLayout(self._row(self.txt_nd_path, btn_nd_browse))
+        btn_nd_launch = icon_button("Launch Nader Downloader", "film", "violet", kind="accent")
+        btn_nd_launch.clicked.connect(self._launch_nader_downloader)
+        lv.addWidget(btn_nd_launch)
+        lv.addWidget(self._muted("Its finished videos appear in the list on the right, ready to open in the editor."))
+        lv.addStretch()
+        layout.addWidget(left, 2)
+
+        right = QFrame()
+        right.setObjectName("Card")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(14, 14, 14, 14)
+        hdr = QLabel("Recent downloads")
+        hdr.setObjectName("Section")
+        hdr.setStyleSheet("font-size: 15px;")
+        rv.addWidget(hdr)
+        self.lst_downloads = QListWidget()
+        self.lst_downloads.setIconSize(QSize(96, 54))
+        self.lst_downloads.itemDoubleClicked.connect(lambda _it: self._open_download_in_editor())
+        rv.addWidget(self.lst_downloads, 1)
+        b_open = icon_button("Open in Video Studio", "film", "blue", kind="primary")
+        b_open.clicked.connect(self._open_download_in_editor)
+        b_folder = icon_button("Show in Folder", "open", "amber")
+        b_folder.clicked.connect(self._show_download_folder)
+        b_refresh = icon_button("Refresh", "reset", "slate")
+        b_refresh.clicked.connect(self._refresh_downloads)
+        rv.addLayout(self._row(b_open, b_folder, b_refresh))
+        layout.addWidget(right, 3)
+        self._dl_proc = None
+        QTimer.singleShot(300, self._refresh_downloads)
+        return tab
+
+    def _choose_dir(self, line: QLineEdit, key: str):
+        d = QFileDialog.getExistingDirectory(self, "Choose Folder", line.text())
+        if d:
+            line.setText(d)
+            self.settings.setValue(key, d)
+            self._refresh_downloads()
+
+    def _find_nader_downloader(self) -> str:
+        saved = str(self.settings.value("nader_downloader", "") or "")
+        for cand in (saved, os.path.join(APP_DIR, "Downloader.py"), os.path.join(APP_DIR, "..", "downloader", "Downloader.py"),
+                     os.path.join(os.path.expanduser("~"), "Desktop", "Downloader.py")):
+            if cand and os.path.isfile(cand):
+                return os.path.abspath(cand)
+        return ""
+
+    def _browse_nader_downloader(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Find Downloader.py", "", "Python (*.py *.pyw)")
+        if p:
+            self.txt_nd_path.setText(p)
+            self.settings.setValue("nader_downloader", p)
+            self._refresh_downloads()
+
+    def _launch_nader_downloader(self):
+        p = self.txt_nd_path.text().strip()
+        if not os.path.isfile(p):
+            QMessageBox.information(self, "Nader Downloader", "Choose where Downloader.py is first.")
+            return
+        self.settings.setValue("nader_downloader", p)
+        py = sys.executable
+        if os.name == "nt" and py.lower().endswith("python.exe") and os.path.exists(py[:-10] + "pythonw.exe"):
+            py = py[:-10] + "pythonw.exe"
+        subprocess.Popen([py, p], cwd=os.path.dirname(p))
+        self.status.showMessage("Nader Downloader opened in its own window.")
+
+    def _download_folders(self):
+        dirs = [self.txt_dl_dir.text().strip()]
+        nd = self.txt_nd_path.text().strip()
+        if nd:
+            dirs.append(os.path.join(os.path.dirname(nd), "Finished_Videos"))
+        return [d for d in dirs if d and os.path.isdir(d)]
+
+    def _refresh_downloads(self):
+        files = []
+        for d in self._download_folders():
+            for root, _dirs, names in os.walk(d):
+                for n in names:
+                    if os.path.splitext(n)[1].lower() in VIDEO_EXTS | {".mp3", ".m4a"} and not n.endswith(".part"):
+                        fp = os.path.join(root, n)
+                        try:
+                            files.append((os.path.getmtime(fp), fp))
+                        except OSError:
+                            pass
+        files.sort(reverse=True)
+        self.lst_downloads.clear()
+        for mtime, fp in files[:60]:
+            size_mb = os.path.getsize(fp) / (1024 * 1024)
+            item = QListWidgetItem(f"{os.path.basename(fp)}\n{size_mb:.1f} MB  •  {os.path.dirname(fp)}")
+            item.setData(Qt.ItemDataRole.UserRole, fp)
+            item.setIcon(make_icon("music" if fp.lower().endswith((".mp3", ".m4a")) else "film", "blue"))
+            self.lst_downloads.addItem(item)
+        if not files:
+            self.lst_downloads.addItem("No downloads yet.")
+
+    def _selected_download(self):
+        it = self.lst_downloads.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _open_download_in_editor(self):
+        fp = self._selected_download()
+        if not fp:
+            return
+        if fp.lower().endswith((".mp3", ".m4a")):
+            self.tabs.setCurrentIndex(0)
+            self.music = MusicTrack(fp)
+            self.music.audio()
+            self._sync_music_ui()
+            self.status.showMessage(f"Added {os.path.basename(fp)} as background music.")
+            return
+        self.tabs.setCurrentIndex(0)
+        self._load_video_paths([fp])
+
+    def _show_download_folder(self):
+        fp = self._selected_download()
+        folder = os.path.dirname(fp) if fp else self.txt_dl_dir.text()
+        if os.name == "nt":
+            if fp:
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(fp)])
+            else:
+                os.startfile(folder)
+        else:
+            subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", folder])
+
+    def _start_download(self):
+        url = self.txt_dl_url.text().strip()
+        cmd0 = ytdlp_command()
+        if not url:
+            self.lbl_dl_status.setText("Paste a link first.")
+            return
+        if not cmd0:
+            QMessageBox.information(self, "Download", "yt-dlp is not installed.\n\nInstall it with:\n    pip install yt-dlp")
+            return
+        out_dir = self.txt_dl_dir.text().strip()
+        os.makedirs(out_dir, exist_ok=True)
+        self.settings.setValue("download_dir", out_dir)
+        q = self.cmb_dl_quality.currentIndex()
+        fmt = {0: ["-f", "bv*+ba/b", "--merge-output-format", "mp4"],
+               1: ["-f", "bv*[height<=1080]+ba/b[height<=1080]", "--merge-output-format", "mp4"],
+               2: ["-f", "bv*[height<=720]+ba/b[height<=720]", "--merge-output-format", "mp4"],
+               3: ["-x", "--audio-format", "mp3"]}[q]
+        cmd = cmd0 + fmt + ["--newline", "--no-playlist", "-o", os.path.join(out_dir, "%(title).80s.%(ext)s"),
+                            "--print", "after_move:filepath"]
+        if FFMPEG_EXE:
+            cmd += ["--ffmpeg-location", FFMPEG_EXE]
+        cmd.append(url)
+        self.btn_dl_start.setEnabled(False)
+        self.btn_dl_stop.setEnabled(True)
+        self.dl_progress.setValue(0)
+        self.lbl_dl_status.setText("Starting…")
+
+        def work():
+            final_path, tail = "", []
+            try:
+                self._dl_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                                 encoding="utf-8", errors="ignore", bufsize=1, creationflags=NO_WINDOW)
+                for line in self._dl_proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    tail = (tail + [line])[-12:]
+                    m = re.search(r"(\d+(?:\.\d+)?)%", line)
+                    if "[download]" in line and m:
+                        pct = float(m.group(1))
+                        self._bridge.call.emit(lambda p=pct, l=line: (self.dl_progress.setValue(int(p)),
+                                                                      self.lbl_dl_status.setText(l.replace("[download]", "").strip()[:110])))
+                    elif os.path.isabs(line) and os.path.exists(line):
+                        final_path = line
+                    elif "[Merger]" in line or "[ExtractAudio]" in line:
+                        self._bridge.call.emit(lambda: self.lbl_dl_status.setText("Merging video and audio…"))
+                rc = self._dl_proc.wait()
+            except Exception as e:
+                rc, tail = -1, [str(e)]
+
+            def done():
+                self._dl_proc = None
+                self.btn_dl_start.setEnabled(True)
+                self.btn_dl_stop.setEnabled(False)
+                if rc == 0 and final_path:
+                    self.dl_progress.setValue(100)
+                    self.lbl_dl_status.setText(f"Saved: {os.path.basename(final_path)}")
+                    self._refresh_downloads()
+                    if self.chk_dl_open.isChecked():
+                        if final_path.lower().endswith(".mp3"):
+                            self.music = MusicTrack(final_path)
+                            self.music.audio()
+                            self._sync_music_ui()
+                            self.tabs.setCurrentIndex(0)
+                        else:
+                            self.tabs.setCurrentIndex(0)
+                            self._load_video_paths([final_path])
+                elif rc != 0:
+                    err = next((t for t in reversed(tail) if "ERROR" in t), tail[-1] if tail else "Download failed.")
+                    self.lbl_dl_status.setText(err[:160])
+            self._bridge.call.emit(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stop_download(self):
+        if self._dl_proc and self._dl_proc.poll() is None:
+            self._dl_proc.kill()
+            self.lbl_dl_status.setText("Stopped.")
+
+
+
+
+
+
     def closeEvent(self, event):
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        busy = [j for j in self.export_jobs if j["status"] not in ("Done", "Failed", "Cancelled")]
+        if busy and QMessageBox.question(self, APP_NAME, f"{len(busy)} export(s) still running. Quit anyway?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+        for j in busy:
+            j["cancel"] = True
         self.play_timer.stop()
         self._stop_preview_audio()
         for r in self.open_captures.values():
             r.release()
+        self.settings.setValue("clean_exit", "true")
+        try:
+            os.remove(self._autosave_path())
+        except OSError:
+            pass
         super().closeEvent(event)
 
 

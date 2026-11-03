@@ -1,0 +1,17 @@
+# ANK Media Studio v3 — install with:  pip install -r requirements.txt
+# Required
+PyQt6
+opencv-python
+numpy
+pillow
+imageio-ffmpeg        # bundled FFmpeg (skip if FFmpeg is already installed)
+
+# AI features (optional but recommended)
+faster-whisper        # AI subtitles / translate speech to English
+demucs                # AI voice / music separation (installs PyTorch, ~1 GB)
+yt-dlp                # Download tab
+
+# Extras (optional)
+# rembg               # best AI background removal
+# argostranslate      # offline subtitle translation to other languages
+# Real-ESRGAN: download "realesrgan-ncnn-vulkan" (GitHub: xinntao/Real-ESRGAN) and point the app to it
