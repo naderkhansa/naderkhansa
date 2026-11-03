@@ -771,7 +771,7 @@ class NaderPlayer:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.2"
+        self.version = "v1.9.3"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -846,6 +846,7 @@ class DownloaderApp:
             ("home", "🏠 Home"),
             ("dlqueue", "📋 Queue"),
             ("library", "📚 Library"),
+            ("find", "🔍 Find"),
             ("sync", "🎙️ Sync"),
             ("manual_edit", "🎛️ Edit"),
             ("queue", "🌙 Narto 5"),
@@ -854,9 +855,9 @@ class DownloaderApp:
         ]
         for key, label in nav_items:
             b = self.make_3d_pill(nav_pills, label, lambda k=key: self.show_page(k))
-            b.pack(side="left", padx=2, pady=8)
+            b.pack(side="left", padx=1, pady=8)
             self.nav_buttons[key] = b
-        self.theme_pill = self.make_3d_pill(nav_pills, {"auto": "🌓 Auto", "dark": "🌙 Dark", "light": "☀️ Light"}.get(self.settings.get("theme"), "🌓 Auto"),
+        self.theme_pill = self.make_3d_pill(nav_pills, {"auto": "🌓", "dark": "🌙", "light": "☀️"}.get(self.settings.get("theme"), "🌓 Auto"),
                                             self.cycle_theme)
         self.theme_pill.pack(side="left", padx=(8, 2), pady=8)
         self.setup_info_mode(nav_pills)
@@ -1066,7 +1067,7 @@ class DownloaderApp:
 
     def make_3d_pill(self, parent, text, command, kind="dark", bg="#111827"):
         f = tkfont.Font(family="Arial", size=9, weight="bold")
-        w = f.measure(text) + 26
+        w = f.measure(text) + 18
 
         class LazyImgs(dict):
             # Each state image is rendered the first time it is shown
@@ -1135,6 +1136,7 @@ class DownloaderApp:
             "dlqueue": "📋 Download Queue (runs overnight, resumes after restart)",
             "library": "📚 Library — everything you downloaded",
             "settings": "⚙️ Settings & Engine Health",
+            "find": "🔍 Find by Image — upload a picture, get the series and its direct links",
         }
         self.header_title_lbl.config(text=titles.get(page_name, "🎬 Nader Video Studio"))
 
@@ -4892,7 +4894,7 @@ class DownloaderApp:
         self.save_settings()
         self.apply_ui_theme(force=True)
         if hasattr(self, "theme_pill"):
-            self.theme_pill.config(text={"auto": "🌓 Auto", "dark": "🌙 Dark", "light": "☀️ Light"}[choice])
+            self.theme_pill.config(text={"auto": "🌓", "dark": "🌙", "light": "☀️"}[choice])
         if hasattr(self, "theme_choice_var"):
             self.theme_choice_var.set(choice)
 
@@ -4911,6 +4913,9 @@ class DownloaderApp:
                                      "resume where they stopped, can run only at night, and can notify you or shut the PC down when finished."),
         "📚 Library": ("Library", "All your finished videos as posters, like a streaming app. Play them in Nader Player (voice-sync fix, "
                                  "Arabic subtitles), share them (AirDrop, Bluetooth, Blip) or delete them."),
+        "🔍 Find": ("Find by Image", "Upload or paste a picture (poster, TikTok screenshot). The app reads the name, searches Narto, "
+                                    "Dailymotion and YouTube, and shows posters that look the same plus titles with the same name — "
+                                    "click one to open its play page in your browser."),
         "🎙️ Sync": ("Voice & Subtitle Sync Studio", "Fixes a finished movie whose sound or subtitles are early/late: one exact shift, "
                                                     "automatic speed + offset matching, or repair of drift that starts in the middle."),
         "🎛️ Edit": ("Full Manual Edit", "3-track editor: video, voice and background music are separated so you can slide, cut, trim, "
@@ -4919,9 +4924,9 @@ class DownloaderApp:
         "✂️ Trim": ("Trim & Crop HD", "Cut parts out of one or many videos, crop black bars or edges, and join the pieces in the order you choose."),
         "⚙️ Settings": ("Settings & Health", "Theme, maximum quality, speed limit, notifications, save folder, and the status of every engine "
                                             "(yt-dlp, FFmpeg, aria2c). Includes one-click Update yt-dlp."),
-        "🌓 Auto": ("Theme: Auto", "Follows your computer's dark/light setting. Click to switch to Dark, again for Light."),
-        "🌙 Dark": ("Theme: Dark", "Dark colours. Click to switch to Light."),
-        "☀️ Light": ("Theme: Light", "Light colours. Click to go back to Auto (follow the computer)."),
+        "🌓": ("Theme: Auto", "Follows your computer's dark/light setting. Click to switch to Dark, again for Light."),
+        "🌙": ("Theme: Dark", "Dark colours. Click to switch to Light."),
+        "☀️": ("Theme: Light", "Light colours. Click to go back to Auto (follow the computer)."),
         "ℹ️ Info": ("Info mode", "While this is ON, pointing at any button, tab or box shows what it does. Click it again to turn the info off."),
         "Shortmax": ("Shortmax tab", "Downloads a Shortmax series episode by episode and merges them. If the site shows its bot check, press "
                                      "'1. Verify Bot Check', pass it in your browser, then '2. Start Shortmax'. A shortmax_cookies.txt next to the app is used first."),
@@ -5017,6 +5022,10 @@ class DownloaderApp:
         ("Update yt-dlp", "Update yt-dlp", "Updates the download engine and its browser-impersonation part. Fixes most 'it stopped working' problems."),
         ("Check Again", "Check engines", "Checks again which engines are installed and working."),
         ("Change Folder", "Save folder", "Choose where finished videos are saved."),
+        ("Choose Image", "Choose image", "Pick a picture from your computer to search with."),
+        ("Paste Image", "Paste image", "Uses the picture you copied (e.g. a screenshot) to search."),
+        ("Search Everywhere", "Search", "Searches every ticked site for the name and compares their posters with your picture."),
+        ("▶ Open", "Open", "Opens the play page of this result in your browser."),
         ("Notify me", "Notifications", "Shows a desktop notification when a download finishes."),
         ("Frame", "Step one frame", "Moves exactly one video frame back or forward — for finding the perfect cut point."),
         ("Auto — follow", "Theme: Auto", "Follows your computer's dark / light setting."),
@@ -5172,6 +5181,7 @@ class DownloaderApp:
             ("start_entry", ("Start episode", "The first episode to download (1 = from the beginning).")),
             ("total_entry", ("Total episodes", "Stop after this episode number. Leave empty to download until the last episode.")),
             ("lib_search", ("Search", "Type part of a title to filter your library.")),
+            ("find_title", ("Name to search", "The name read from your picture. Fix or shorten it if needed, then press Enter.")),
             ("q_url_entry", ("Queue link", "Link (or file) to add to the queue — choose the site on the left first.")),
         ]
         for attr, h in fields:
@@ -5471,6 +5481,7 @@ class DownloaderApp:
     def build_extra_pages(self):
         self.build_dl_queue_page()
         self.build_library_page()
+        self.build_find_page()
         self.build_settings_page()
 
     def _page_header(self, page, text, sub):
@@ -6397,6 +6408,443 @@ class DownloaderApp:
         self.update_log = tk.Text(right, height=9, bg="#0f172a", fg="#cbd5e1", insertbackground="#ffffff", font=("Courier", 9),
                                   relief="flat", highlightthickness=1, highlightbackground="#1e293b")
         self.update_log.pack(fill="both", expand=True, pady=(6, 0))
+
+
+    # =========================================================================
+    # 🔍 FIND BY IMAGE (v1.9.3): upload / paste a picture → read its title → search the sites
+    # → show IMAGE matches (poster looks the same) and NAME matches, each with its direct link
+    # =========================================================================
+    FIND_THUMB = (120, 170)
+
+    # ---------------------------------------------------------------- reading the title (OCR)
+    def ocr_image_text(self, path):
+        """Text in the picture: rapidocr (if installed) → Windows built-in OCR → '' (you can type the name)."""
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            if not hasattr(self, "_rapidocr"):
+                self._rapidocr = RapidOCR()
+            res, _ = self._rapidocr(path)
+            lines = [r[1] for r in (res or []) if r[2] > 0.5]
+            if lines:
+                return lines
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            png = os.path.join(self.base_dir, ".find_cache", "_ocr_input.png")
+            os.makedirs(os.path.dirname(png), exist_ok=True)
+            self.run_ffmpeg(["ffmpeg", "-y", "-i", path, "-vf", "scale='min(1600,iw)':-2", "-frames:v", "1", png])
+            ps = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+function Await($op, $type) { $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:ANK_OCR_FILE)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bmp = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+$res = Await ($engine.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult])
+$res.Lines | ForEach-Object { $_.Text }
+'''
+            try:
+                env = dict(os.environ, ANK_OCR_FILE=os.path.abspath(png if os.path.exists(png) else path))
+                r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], capture_output=True,
+                                   text=True, encoding="utf-8", errors="ignore", timeout=60, env=env, creationflags=0x08000000)
+                lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+                if lines:
+                    return lines
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def title_from_ocr(lines):
+        """Keeps the words that look like a title (drops clock, battery, EP numbers, likes…)."""
+        junk = re.compile(r"^(lte|5g|4g|wifi|ep ?\d*|ep0+\w*|\d+[:.]?\d*|[0-9.,k]+|follow|share|like|more|for you|following)$", re.IGNORECASE)
+        words = []
+        for ln in lines:
+            t = re.sub(r"[^\w'’&\- ]+", " ", ln).strip()
+            if not t or junk.match(t) or len(re.sub(r"[^A-Za-z؀-ۿ]", "", t)) < 2:
+                continue
+            words.append(t)
+        title = " ".join(words)
+        title = re.sub(r"\s+", " ", title).strip()
+        return title[:90]
+
+    # ------------------------------------------------------------------- image fingerprints
+    def _img_pixels(self, path, crop_expr, w, h):
+        """RGB pixels (list of (r,g,b)) of a crop of the picture, resized to w×h, via FFmpeg."""
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        vf = (crop_expr + "," if crop_expr else "") + f"scale={w}:{h}:flags=area"
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", vf, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                           capture_output=True, **kwargs)
+        b = r.stdout
+        if len(b) < w * h * 3:
+            return None
+        return [(b[i], b[i + 1], b[i + 2]) for i in range(0, w * h * 3, 3)]
+
+    @staticmethod
+    def _fingerprint(px):
+        gray = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in px]
+        m = sum(gray) / len(gray)
+        v = [x - m for x in gray]
+        n = math.sqrt(sum(x * x for x in v)) or 1.0
+        hist = [0] * 64
+        for r, g, b in px:
+            hist[(r >> 6) * 16 + (g >> 6) * 4 + (b >> 6)] += 1
+        tot = float(len(px))
+        return [x / n for x in v], [x / tot for x in hist]
+
+    FIND_W, FIND_H = 18, 27   # 2:3 poster shape
+
+    def _crops_for(self, path, query=False):
+        """Poster-shaped crops: several for your picture (it may be a phone screenshot with buttons), fewer for posters."""
+        crops = []
+        if query:
+            # a 2:3 window at several sizes and heights over the picture
+            for scale in (1.0, 0.85, 0.7, 0.55):
+                for ypos in (0.0, 0.25, 0.5, 0.75, 1.0):
+                    crops.append(f"crop='min(iw,ih*2/3)*{scale}':'min(iw,ih*2/3)*{scale}*3/2':"
+                                 f"'(iw-min(iw,ih*2/3)*{scale})/2':'(ih-min(iw,ih*2/3)*{scale}*3/2)*{ypos}'")
+        else:
+            crops.append("crop='min(iw,ih*2/3)':'min(iw,ih*2/3)*3/2'")
+            crops.append("crop='min(iw,ih*2/3)*0.85':'min(iw,ih*2/3)*0.85*3/2'")
+        out = []
+        for c in crops:
+            px = self._img_pixels(path, c, self.FIND_W, self.FIND_H)
+            if px:
+                out.append(self._fingerprint(px))
+        return out
+
+    @staticmethod
+    def _similarity(a, b):
+        corr = sum(x * y for x, y in zip(a[0], b[0]))                  # shapes / layout (-1..1)
+        hist = sum(min(x, y) for x, y in zip(a[1], b[1]))              # colours (0..1)
+        return max(0.0, 0.7 * max(0.0, corr) + 0.3 * hist)
+
+    def image_match_score(self, query_prints, poster_path):
+        cands = self._crops_for(poster_path)
+        if not cands or not query_prints:
+            return 0.0
+        return max(self._similarity(q, c) for q in query_prints for c in cands)
+
+    @staticmethod
+    def name_score(query, title):
+        import difflib
+        nq = re.sub(r"[^a-z0-9؀-ۿ ]", "", (query or "").lower().replace("’", "'"))
+        nt = re.sub(r"[^a-z0-9؀-ۿ ]", "", (title or "").lower().replace("’", "'"))
+        if not nq or not nt:
+            return 0.0
+        qs, ts = set(nq.split()), set(nt.split())
+        overlap = len(qs & ts) / max(1, len(qs))
+        return 0.55 * overlap + 0.45 * difflib.SequenceMatcher(None, nq, nt).ratio()
+
+    # ------------------------------------------------------------------------ site searches
+    def _search_narto(self, q):
+        out = []
+        for host in ("narto-drama.com",):
+            html = self.curl_fetch(f"https://{host}/search?lang=en-US&q={urllib.parse.quote_plus(q)}")
+            if not html or self.is_browser_check_page(html):
+                continue
+            for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']*(?:/detail/|/watch/|/movie/|/series/)[^"\']*)["\'][^>]*>(.*?)</a>', html, re.S | re.I):
+                href, inner = m.group(1), m.group(2)
+                img = re.search(r'<img\b[^>]*?(?:data-src|data-original|src)=["\']([^"\']+)["\'][^>]*>', inner, re.I)
+                if not img:
+                    continue
+                alt = re.search(r'alt=(["\'])(.*?)\1', img.group(0), re.I | re.S)
+                txt = re.sub(r"<[^>]+>", " ", inner)
+                txt = re.sub(r"\s+", " ", txt).strip()
+                title = (alt.group(2) if alt and len(alt.group(2)) > 3 else "") or txt[:90]
+                prov = re.search(r'(PineDrama|ReelShort|FlareFlow|FreeReels|Melolo|Narto Drama|ShortMax|DramaBox|GoodShort|OhMyTV|NetShort)', inner, re.I)
+                out.append({"site": "Narto", "title": re.sub(r"&#0?39;|&apos;", "'", title).replace("&amp;", "&"),
+                            "link": urllib.parse.urljoin(f"https://{host}/", href),
+                            "thumb": urllib.parse.urljoin(f"https://{host}/", img.group(1).replace("&amp;", "&")),
+                            "info": prov.group(1) if prov else "narto-drama.com"})
+        seen, uniq = set(), []
+        for r in out:
+            if r["link"] not in seen:
+                seen.add(r["link"])
+                uniq.append(r)
+        return uniq[:40]
+
+    def _search_dailymotion(self, q):
+        url = ("https://api.dailymotion.com/videos?" + urllib.parse.urlencode(
+            {"search": q, "fields": "id,title,thumbnail_360_url,url,duration,owner.screenname", "limit": 30}))
+        data = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=20).read())
+        return [{"site": "Dailymotion", "title": v.get("title", ""), "link": v.get("url", ""), "thumb": v.get("thumbnail_360_url", ""),
+                 "info": f"{v.get('owner.screenname', '')} • {int(v.get('duration') or 0) // 60} min"} for v in data.get("list", [])]
+
+    def _search_youtube(self, q):
+        yt = self.get_yt_dlp_path()
+        if not yt or not os.path.exists(yt):
+            return []
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        r = subprocess.run([yt, "--flat-playlist", "-J", "--no-warnings", f"ytsearch20:{q}"], capture_output=True, text=True,
+                           encoding="utf-8", errors="ignore", timeout=60, **kwargs)
+        out = []
+        for e in (json.loads(r.stdout or "{}").get("entries") or []):
+            thumbs = e.get("thumbnails") or []
+            th = thumbs[-1]["url"] if thumbs else f"https://i.ytimg.com/vi/{e.get('id')}/hqdefault.jpg"
+            out.append({"site": "YouTube", "title": e.get("title", ""), "link": e.get("url") or f"https://www.youtube.com/watch?v={e.get('id')}",
+                        "thumb": th, "info": f"{e.get('channel') or ''} • {int(e.get('duration') or 0) // 60} min"})
+        return out
+
+    # ----------------------------------------------------------------------------- the page
+    def build_find_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["find"] = page
+        self.find_cache = os.path.join(self.base_dir, ".find_cache")
+        os.makedirs(self.find_cache, exist_ok=True)
+        left = tk.Frame(page, bg="#111a2c", width=300, highlightthickness=1, highlightbackground="#24324d")
+        left.pack(side="left", fill="y", padx=(12, 6), pady=10)
+        left.pack_propagate(False)
+        tk.Label(left, text="🔍 Find by Image", font=("Arial", 14, "bold"), bg="#111a2c", fg="#f8fafc").pack(anchor="w", padx=12, pady=(12, 0))
+        tk.Label(left, text="Upload or paste a picture (a poster, a TikTok screenshot…). The app reads its name, searches the sites "
+                            "and shows the posters that look the same.", bg="#111a2c", fg="#94a3b8", font=("Arial", 9),
+                 wraplength=270, justify="left").pack(anchor="w", padx=12, pady=(2, 8))
+        row = tk.Frame(left, bg="#111a2c")
+        row.pack(fill="x", padx=12)
+        ttk.Button(row, text="🖼️ Choose Image…", style="Accent.TButton", command=self.find_choose_image).pack(side="left")
+        ttk.Button(row, text="📋 Paste Image", command=self.find_paste_image).pack(side="left", padx=4)
+        self.find_preview = tk.Label(left, bg="#0b0f19", width=220, height=300, text="No picture yet", fg="#475569")
+        self.find_preview.pack(padx=12, pady=8)
+        tk.Label(left, text="Name found in the picture (you can edit it):", bg="#111a2c", fg="#cbd5e1", font=("Arial", 9, "bold")).pack(anchor="w", padx=12)
+        self.find_title = ttk.Entry(left)
+        self.find_title.pack(fill="x", padx=12, pady=(2, 6))
+        self.find_title.bind("<Return>", lambda e: self.find_start())
+        self.find_sites = {}
+        for key, label in (("Narto", "Narto-Drama (all providers)"), ("Dailymotion", "Dailymotion"), ("YouTube", "YouTube")):
+            v = tk.BooleanVar(value=True)
+            ttk.Checkbutton(left, text=label, variable=v, style="Panel.TCheckbutton").pack(anchor="w", padx=12)
+            self.find_sites[key] = v
+        self.find_btn = ttk.Button(left, text="🔎 Search Everywhere", style="Success.TButton", command=self.find_start)
+        self.find_btn.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(left, text="Open the same search on:", bg="#111a2c", fg="#94a3b8", font=("Arial", 9)).pack(anchor="w", padx=12, pady=(8, 2))
+        r2 = tk.Frame(left, bg="#111a2c")
+        r2.pack(fill="x", padx=12)
+        for txt, url in (("TikTok", "https://www.tiktok.com/search?q={q}"), ("Shortmax", "https://www.google.com/search?q=site%3Ashorttw.live+{q}"),
+                         ("Google", "https://www.google.com/search?tbm=isch&q={q}")):
+            ttk.Button(r2, text=txt, width=8, command=lambda u=url: webbrowser.open(u.format(q=urllib.parse.quote_plus(self.find_title.get().strip())))).pack(side="left", padx=1)
+        self.find_status = tk.Label(left, text="", bg="#111a2c", fg="#fbbf24", font=("Arial", 9), wraplength=270, justify="left")
+        self.find_status.pack(anchor="w", padx=12, pady=8)
+
+        right = tk.Frame(page, bg="#0b0f19")
+        right.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=10)
+        self.find_canvas = tk.Canvas(right, bg="#0b0f19", highlightthickness=0)
+        vs = ttk.Scrollbar(right, orient="vertical", command=self.find_canvas.yview)
+        self.find_canvas.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        self.find_canvas.pack(side="left", fill="both", expand=True)
+        self.find_inner = tk.Frame(self.find_canvas, bg="#0b0f19")
+        self._find_win = self.find_canvas.create_window(0, 0, window=self.find_inner, anchor="nw")
+        self.find_inner.bind("<Configure>", lambda e: self.find_canvas.configure(scrollregion=self.find_canvas.bbox("all")))
+        self.find_canvas.bind("<Configure>", lambda e: (self.find_canvas.itemconfigure(self._find_win, width=e.width), self._find_relayout(e.width)))
+        for w in (self.find_canvas, self.find_inner):
+            w.bind("<MouseWheel>", lambda e: self.find_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"))
+            w.bind("<Button-4>", lambda e: self.find_canvas.yview_scroll(-3, "units"))
+            w.bind("<Button-5>", lambda e: self.find_canvas.yview_scroll(3, "units"))
+        self.find_image_path = ""
+        self._find_imgs = []
+        self._find_results = None
+        self._find_cols = 0
+        tk.Label(self.find_inner, text="Results appear here:\n🖼️ Image matches — posters that look like your picture\n"
+                                       "🔤 Name matches — titles like the name in your picture\n\nClick any result to open its play page in your browser.",
+                 bg="#0b0f19", fg="#64748b", font=("Arial", 11), justify="left").pack(anchor="w", padx=20, pady=40)
+
+    def find_choose_image(self):
+        p = filedialog.askopenfilename(title="Choose a picture", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All", "*.*")])
+        if p:
+            self.find_set_image(p)
+
+    def find_paste_image(self):
+        out = os.path.join(self.find_cache, f"pasted_{int(time.time())}.png")
+        try:
+            if sys.platform == "win32":
+                ps = ("Add-Type -AssemblyName System.Windows.Forms; $i=[System.Windows.Forms.Clipboard]::GetImage(); "
+                      f"if($i){{$i.Save('{out}',[System.Drawing.Imaging.ImageFormat]::Png)}}")
+                subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], timeout=20, creationflags=0x08000000)
+            elif sys.platform == "darwin":
+                subprocess.run(["osascript", "-e", f'set f to open for access POSIX file "{out}" with write permission',
+                                "-e", "write (the clipboard as «class PNGf») to f", "-e", "close access f"], timeout=20)
+            else:
+                with open(out, "wb") as f:
+                    subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-o"], stdout=f, timeout=20)
+        except Exception:
+            pass
+        if os.path.exists(out) and os.path.getsize(out) > 100:
+            self.find_set_image(out)
+        else:
+            messagebox.showinfo("Paste image", "There is no picture in the clipboard. Copy an image (or take a screenshot) first.")
+
+    def find_set_image(self, path):
+        self.find_image_path = path
+        prev = os.path.join(self.find_cache, "_preview.png")
+        self.run_ffmpeg(["ffmpeg", "-y", "-i", path, "-vf", "scale=220:300:force_original_aspect_ratio=decrease", "-frames:v", "1", prev])
+        try:
+            self._find_prev_img = tk.PhotoImage(file=prev)
+            self.find_preview.config(image=self._find_prev_img, text="", width=220, height=300)
+        except Exception:
+            pass
+        self.find_status.config(text="Reading the name in the picture…")
+        self.find_title.delete(0, tk.END)
+
+        def work():
+            lines = self.ocr_image_text(path)
+            title = self.title_from_ocr(lines)
+
+            def done():
+                self.find_title.delete(0, tk.END)
+                self.find_title.insert(0, title)
+                if title:
+                    self.find_status.config(text=f"Found the name: “{title}”. Fix it if needed, then press Search.")
+                    self.find_start()
+                else:
+                    self.find_status.config(text="Couldn't read a name in the picture. Type the name (even part of it) and press Search — "
+                                                 "the picture is still used to rank the posters.")
+            self.root.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def find_start(self):
+        q = self.find_title.get().strip()
+        if not q:
+            messagebox.showinfo("Find", "Type the name (or part of it) first.")
+            return
+        self.find_btn.config(state="disabled")
+        self.find_status.config(text="Searching the sites…")
+        threading.Thread(target=self._find_worker, args=(q,), daemon=True).start()
+
+    def _find_worker(self, q):
+        say = lambda t: self.root.after(0, lambda: self.find_status.config(text=t))
+        results, errors = [], []
+        queries = [q]
+        words = q.split()
+        if len(words) > 4:
+            queries.append(" ".join(words[:4]))
+        for site, fn in (("Narto", self._search_narto), ("Dailymotion", self._search_dailymotion), ("YouTube", self._search_youtube)):
+            if not self.find_sites[site].get():
+                continue
+            for qq in queries:
+                say(f"Searching {site} for “{qq}”…")
+                try:
+                    results += fn(qq)
+                except Exception as e:
+                    errors.append(f"{site}: {e}")
+        seen, uniq = set(), []
+        for r in results:
+            if r["link"] and r["link"] not in seen:
+                seen.add(r["link"])
+                uniq.append(r)
+        query_prints = self._crops_for(self.find_image_path, query=True) if self.find_image_path else []
+        import hashlib
+        for k, r in enumerate(uniq, 1):
+            say(f"Comparing posters with your picture… {k}/{len(uniq)}")
+            r["name_score"] = self.name_score(q, r["title"])
+            r["img_score"] = 0.0
+            r["thumb_png"] = ""
+            if not r.get("thumb"):
+                continue
+            raw = os.path.join(self.find_cache, hashlib.md5(r["thumb"].encode()).hexdigest()[:16])
+            png = raw + ".png"
+            try:
+                if not os.path.exists(raw):
+                    req = urllib.request.Request(r["thumb"], headers={"User-Agent": self.NARTO_UA, "Referer": r["link"]})
+                    with open(raw, "wb") as f:
+                        f.write(urllib.request.urlopen(req, timeout=15).read(6 * 1024 * 1024))
+                if not os.path.exists(png):
+                    self.run_ffmpeg(["ffmpeg", "-y", "-i", raw, "-vf", f"scale={self.FIND_THUMB[0]}:{self.FIND_THUMB[1]}:force_original_aspect_ratio=increase,"
+                                     f"crop={self.FIND_THUMB[0]}:{self.FIND_THUMB[1]}", "-frames:v", "1", png])
+                r["thumb_png"] = png if os.path.exists(png) else ""
+                if query_prints:
+                    r["img_score"] = self.image_match_score(query_prints, raw)
+            except Exception:
+                pass
+        self._find_results = (q, uniq, bool(query_prints))
+        msg = f"{len(uniq)} results." + (f"  (Not searched: {'; '.join(errors)[:160]})" if errors else "")
+        if not any(r["site"] == "Narto" for r in uniq) and self.find_sites["Narto"].get():
+            msg += "  Narto gave no results — if it shows a browser check, open narto-drama.com once in Edge/Firefox."
+        self.root.after(0, lambda: (self.find_status.config(text=msg), self.find_btn.config(state="normal"), self._find_render()))
+
+    def _find_relayout(self, width):
+        cols = max(1, (width - 20) // 236)
+        if cols != self._find_cols:
+            self._find_cols = cols
+            if self._find_results:
+                self._find_render()
+
+    def _find_render(self):
+        for w in self.find_inner.winfo_children():
+            w.destroy()
+        self._find_imgs = []
+        q, res, has_img = self._find_results
+        cols = max(1, self._find_cols or 5)
+        img_hits = sorted([r for r in res if r["img_score"] >= 0.65], key=lambda r: -r["img_score"])[:12] if has_img else []
+        name_hits = sorted([r for r in res if r["name_score"] >= 0.35], key=lambda r: -r["name_score"])[:30]
+        sections = []
+        if has_img:
+            sections.append(("🖼️ Image matches — posters that look like your picture", img_hits, "img_score",
+                             "No poster looks like your picture yet — check the name matches below."))
+        sections.append((f"🔤 Name matches — “{q}”", name_hits, "name_score", "No titles like this name were found."))
+        for title, items, key, empty in sections:
+            tk.Label(self.find_inner, text=title, bg="#0b0f19", fg="#38bdf8", font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(12, 4))
+            grid = tk.Frame(self.find_inner, bg="#0b0f19")
+            grid.pack(fill="x", padx=6)
+            if not items:
+                tk.Label(grid, text=empty, bg="#0b0f19", fg="#64748b", font=("Arial", 10)).grid(row=0, column=0, padx=10, sticky="w")
+            for k, r in enumerate(items):
+                self._find_card(grid, r, key).grid(row=k // cols, column=k % cols, padx=6, pady=6, sticky="n")
+        if getattr(self, "_theme_now", "dark") == "light":
+            self._remap_tree(self.find_inner, True)
+        self.find_canvas.yview_moveto(0)
+
+    def _find_card(self, parent, r, key):
+        site_col = {"Narto": "#a855f7", "Dailymotion": "#38bdf8", "YouTube": "#f43f5e"}.get(r["site"], "#10b981")
+        card = tk.Frame(parent, bg="#131b2e", highlightthickness=2 if key == "img_score" else 1,
+                        highlightbackground=site_col if key == "img_score" else "#24324d", cursor="hand2")
+        img = None
+        if r.get("thumb_png"):
+            try:
+                img = tk.PhotoImage(file=r["thumb_png"])
+            except Exception:
+                img = None
+        self._find_imgs.append(img)
+        pic = tk.Label(card, image=img, bg="#0b0f19", width=self.FIND_THUMB[0], height=self.FIND_THUMB[1]) if img else \
+            tk.Label(card, text="(no picture)", bg="#0b0f19", fg="#475569", width=16, height=10)
+        pic.pack(padx=5, pady=(5, 2))
+        tk.Label(card, text=f" {r['site']} ", bg=site_col, fg="#ffffff", font=("Arial", 8, "bold")).pack(anchor="w", padx=6)
+        tk.Label(card, text=r["title"][:70], bg="#131b2e", fg="#f8fafc", font=("Arial", 9, "bold"), wraplength=self.FIND_THUMB[0] + 6,
+                 justify="left").pack(anchor="w", padx=6)
+        pct = int(round(r[key] * 100))
+        extra = f"🖼️ looks {pct}% alike" if key == "img_score" else f"🔤 name {pct}% match"
+        tk.Label(card, text=f"{extra}\n{r.get('info', '')[:40]}", bg="#131b2e", fg="#94a3b8", font=("Arial", 8), justify="left").pack(anchor="w", padx=6)
+        link = tk.Label(card, text=r["link"].replace("https://", "")[:34] + "…", bg="#131b2e", fg="#60a5fa", font=("Arial", 8, "underline"), cursor="hand2")
+        link.pack(anchor="w", padx=6)
+        row = tk.Frame(card, bg="#131b2e")
+        row.pack(fill="x", padx=4, pady=(2, 6))
+        ttk.Button(row, text="▶ Open", style="Accent.TButton", width=7, command=lambda: webbrowser.open(r["link"])).pack(side="left")
+        ttk.Button(row, text="⬇️", width=3, command=lambda: self._find_download(r)).pack(side="left", padx=2)
+        ttk.Button(row, text="📋", width=3, command=lambda: (self.root.clipboard_clear(), self.root.clipboard_append(r["link"]),
+                                                          self.find_status.config(text="Link copied."))).pack(side="left")
+        for w in (card, pic, link):
+            w.bind("<Button-1>", lambda e: webbrowser.open(r["link"]))
+        for w in [card] + list(card.winfo_children()):
+            w.bind("<MouseWheel>", lambda e: self.find_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"), add="+")
+            w.bind("<Button-4>", lambda e: self.find_canvas.yview_scroll(-3, "units"), add="+")
+            w.bind("<Button-5>", lambda e: self.find_canvas.yview_scroll(3, "units"), add="+")
+        pic._help = ("Open this result", f"{r['title']}\n{r['site']} — {r.get('info', '')}\n{r['link']}\n\nClick to open the play page in your browser.")
+        return card
+
+    def _find_download(self, r):
+        target = {"Narto": ("url_entry7", 2), "Dailymotion": ("url_entry5", 3), "YouTube": ("url_entry3", 5)}.get(r["site"], ("url_entry3", 5))
+        entry = getattr(self, target[0])
+        entry.delete(0, tk.END)
+        entry.insert(0, r["link"])
+        self.show_page("home")
+        try: self.home_tabs.select(target[1])
+        except Exception: pass
+        self.update_status(f"Link ready in the {r['site']} tab — press its Download button (or ➕ Add to Queue).", "green")
 
     def _save_download_prefs(self):
         self.settings["max_quality"] = {"Best available": "best", "1080p": "1080", "720p": "720", "480p": "480",
