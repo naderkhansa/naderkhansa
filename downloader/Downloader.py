@@ -801,7 +801,7 @@ class NaderPlayer:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.5"
+        self.version = "v1.9.6"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -4935,7 +4935,7 @@ class DownloaderApp:
         "theme": "auto", "max_quality": "best", "speed_limit": "", "notify": True,
         "queue_end_action": "notify", "schedule_on": False, "schedule_from": "01:00", "schedule_to": "07:00",
         "turbo": True, "sync_lock": True, "auto_sub": True, "narto_workers": 3, "output_dir": "",
-        "fme_monitor": "Small", "info_mode": False, "opensubtitles_key": "",
+        "fme_monitor": "Small", "info_mode": False, "sec_per_ep": 0, "opensubtitles_key": "",
     }
 
     def load_settings(self):
@@ -5663,12 +5663,15 @@ class DownloaderApp:
 
         lst = ttk.LabelFrame(page, text="Queue", padding=(10, 6))
         lst.pack(fill="both", expand=True, padx=14, pady=4)
-        cols = ("type", "link", "eps", "status")
+        cols = ("type", "link", "eps", "status", "progress", "eta")
         self.q_tree = ttk.Treeview(lst, columns=cols, show="headings", height=10)
-        for c, w_, title in (("type", 170, "Type"), ("link", 520, "Link / file"), ("eps", 90, "Episodes"), ("status", 200, "Status")):
+        for c, w_, title in (("type", 150, "Type"), ("link", 430, "Link / file"), ("eps", 70, "Episodes"), ("status", 110, "Status"),
+                             ("progress", 190, "Now downloading"), ("eta", 150, "Time left")):
             self.q_tree.heading(c, text=title)
             self.q_tree.column(c, width=w_, anchor="w")
         self.q_tree.pack(fill="both", expand=True)
+        self.q_total_lbl = tk.Label(lst, text="", bg="#131b2e", fg="#38bdf8", font=("Arial", 10, "bold"), anchor="w")
+        self.q_total_lbl.pack(fill="x", pady=(4, 0))
         btns = ttk.Frame(lst, style="Card.TFrame")
         btns.pack(fill="x", pady=(6, 0))
         self.q_start_btn = ttk.Button(btns, text="▶️ Start Queue", style="Success.TButton", command=self.start_dl_queue)
@@ -5706,6 +5709,7 @@ class DownloaderApp:
         self._queue_running = False
         self._queue_pause_req = False
         self._load_queue()
+        self.root.after(1500, self._queue_tick)
 
     def _queue_pick_file(self):
         f = filedialog.askopenfilename(title="Choose a TikTok link list or .torrent", filetypes=[("Lists / torrents", "*.txt *.rtf *.torrent"), ("All files", "*.*")])
@@ -5746,7 +5750,8 @@ class DownloaderApp:
         titles = dict(self.QUEUE_TYPES)
         for i, j in enumerate(self.dl_queue):
             eps = f"{j.get('start', 1)}–{j.get('total') or 'all'}" if j["type"] not in ("tiktok", "dailymotion", "direct", "torrent") else "—"
-            self.q_tree.insert("", "end", iid=str(i), values=(titles.get(j["type"], j["type"]), j["url"], eps, j.get("status", "Pending")))
+            self.q_tree.insert("", "end", iid=str(i), values=(titles.get(j["type"], j["type"]), j["url"], eps, j.get("status", "Pending"),
+                                                            j.get("progress_txt", ""), j.get("eta_txt", "")))
         for s in sel:
             if self.q_tree.exists(s):
                 self.q_tree.selection_add(s)
@@ -5874,6 +5879,8 @@ class DownloaderApp:
                     job["status"] = "Pending"
                     break
                 job["status"] = "Running"
+                job["started"] = time.time()
+                job.pop("progress_txt", None)
                 self._save_queue()
                 self.root.after(0, self._refresh_queue_view)
                 ok = self._run_queue_job(job)
@@ -5883,6 +5890,13 @@ class DownloaderApp:
                     break
                 job["status"] = "Done ✅" if ok else "Failed ❌ (see log)"
                 job["finished"] = time.time()
+                job["eta_txt"] = f"took {self._fmt_dur(job['finished'] - job.get('started', job['finished']))}"
+                job["progress_txt"] = ""
+                if ok and job.get("_eps_done"):     # learn how long one episode takes on this computer
+                    spe = (job["finished"] - job["started"]) / max(1, job["_eps_done"])
+                    old = float(self.settings.get("sec_per_ep") or spe)
+                    self.settings["sec_per_ep"] = round(0.6 * old + 0.4 * spe, 1)
+                    self.save_settings()
                 if ok:
                     finished += 1
                 self._save_queue()
@@ -5894,6 +5908,102 @@ class DownloaderApp:
             pending = any(j.get("status", "").startswith("Pending") for j in self.dl_queue)
             if not pending and not self.stop_flag and not self._queue_pause_req:
                 self.root.after(0, lambda: self._queue_finished(finished))
+
+    @staticmethod
+    def _fmt_dur(sec):
+        sec = int(max(0, sec))
+        if sec < 60:
+            return f"{sec} s"
+        if sec < 3600:
+            return f"{sec // 60} min"
+        return f"{sec // 3600} h {sec % 3600 // 60:02d} min"
+
+    def _job_episode_count(self, j):
+        start = int(j.get("start") or 1)
+        if str(j.get("total", "")).isdigit():
+            return max(1, int(j["total"]) - start + 1)
+        if j.get("_series_total"):
+            return max(1, int(j["_series_total"]) - start + 1)
+        return None
+
+    def _queue_tick(self):
+        """Every second: what the running item is doing, and how long every item will still take."""
+        try:
+            if not hasattr(self, "q_tree"):
+                return
+            spe = float(self.settings.get("sec_per_ep") or 30.0)
+            now = time.time()
+            remaining_total, unknown = 0.0, 0
+            for i, j in enumerate(self.dl_queue):
+                st = str(j.get("status", ""))
+                if st == "Running":
+                    txt = self.status_label.cget("text")
+                    pct = int(self.progress_bar["value"] or 0)
+                    start = int(j.get("start") or 1)
+                    hint = getattr(self, "_series_total_hint", None)
+                    if hint and not str(j.get("total", "")).isdigit():
+                        j["_series_total"] = hint
+                    n_eps = self._job_episode_count(j)
+                    done = None
+                    m = re.search(r"(\d+)/(\d+) episodes done", txt)
+                    if m:
+                        done = int(m.group(1))
+                        n_eps = n_eps or int(m.group(2))
+                        cur = f"EP {start + done}"
+                    else:
+                        m = re.search(r"Episode (\d+)", txt)
+                        if m:
+                            done = int(m.group(1)) - start
+                            cur = f"EP {m.group(1)}"
+                        else:
+                            cur = "merging…" if "erg" in txt else "starting…"
+                    if done is not None:
+                        j["_eps_done"] = done
+                    elapsed = now - j.get("started", now)
+                    if done and done > 0 and n_eps:
+                        rate = elapsed / done
+                        left = max(0.0, (n_eps - done) * rate)
+                    elif n_eps:
+                        left = max(0.0, n_eps * spe - elapsed)
+                    else:
+                        left = None
+                    j["progress_txt"] = f"{cur}" + (f" of {start + n_eps - 1}" if n_eps else "") + (f"  •  {pct}%" if pct else "")
+                    if cur == "merging…":
+                        j["progress_txt"] = "joining the episodes…"
+                        j["eta_txt"] = "almost done"
+                    elif left is None:
+                        j["eta_txt"] = f"running {self._fmt_dur(elapsed)}"
+                        unknown += 1
+                    else:
+                        j["eta_txt"] = f"~{self._fmt_dur(left)} (≈ {datetime.datetime.fromtimestamp(now + left).strftime('%H:%M')})"
+                        remaining_total += left
+                elif st.startswith(("Pending", "Waiting")):
+                    n = self._job_episode_count(j)
+                    if n:
+                        est = n * spe
+                        j["eta_txt"] = f"~{self._fmt_dur(est)}"
+                        remaining_total += est
+                    else:
+                        j["eta_txt"] = "? (episodes not known yet)"
+                        unknown += 1
+                    j["progress_txt"] = "waiting"
+                if self.q_tree.exists(str(i)):
+                    vals = list(self.q_tree.item(str(i), "values"))
+                    if len(vals) == 6 and (vals[3], vals[4], vals[5]) != (j.get("status", ""), j.get("progress_txt", ""), j.get("eta_txt", "")):
+                        vals[3], vals[4], vals[5] = j.get("status", ""), j.get("progress_txt", ""), j.get("eta_txt", "")
+                        self.q_tree.item(str(i), values=vals)
+            active = any(str(j.get("status", "")).startswith(("Running", "Pending", "Waiting")) for j in self.dl_queue)
+            if active and (remaining_total or unknown):
+                end = datetime.datetime.fromtimestamp(now + remaining_total).strftime("%a %H:%M")
+                self.q_total_lbl.config(text=f"⏱️ Whole queue: about {self._fmt_dur(remaining_total)} left — finishes around {end}"
+                                             + (f"  (+ {unknown} item(s) with unknown length)" if unknown else "")
+                                             + f"   •   learned speed: ~{int(spe)} s per episode")
+            else:
+                self.q_total_lbl.config(text="")
+        except Exception:
+            pass
+        finally:
+            self.root.after(1000, self._queue_tick)
 
     def _queue_finished(self, finished):
         action = self.settings.get("queue_end_action", "notify")
