@@ -771,7 +771,7 @@ class NaderPlayer:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.3"
+        self.version = "v1.9.4"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -1178,7 +1178,99 @@ class DownloaderApp:
         else:
             self.show_page("home", push_history=False)
 
+    # v1.9.4: closing while something is running asks first and shows what is running
+    def running_jobs(self):
+        jobs = []
+        try:
+            downloading = str(self.stop_btn.cget("state")) == "normal"
+        except Exception:
+            downloading = False
+        if downloading:
+            url = getattr(self, "_current_dl_url", "") or ""
+            name = self.series_key_from_url(url) if url else ""
+            pct = int(self.progress_bar["value"] or 0) if hasattr(self, "progress_bar") else 0
+            line = "⬇️ Downloading" + (f" “{name}”" if name else "")
+            jobs.append((line, f"{self.status_label.cget('text')}" + (f"  ({pct}%)" if pct else "") + (f"\n{url}" if url else "")))
+        if getattr(self, "_queue_running", False):
+            left = sum(1 for j in getattr(self, "dl_queue", []) if str(j.get("status", "")).startswith(("Pending", "Running", "Waiting")))
+            jobs.append(("📋 Download Queue is running", f"{left} item(s) not finished yet — they resume next time you start the queue."))
+        if self.sync_process is not None and self.sync_process.poll() is None:
+            jobs.append(("🎙️ Sync Studio is saving a movie", "Quitting now leaves that movie unfinished."))
+        if not downloading and self.current_process is not None and self.current_process.poll() is None:
+            jobs.append(("🎬 A video job is running", "An edit, trim or merge is being written."))
+        return jobs
+
     def on_app_close(self):
+        jobs = self.running_jobs()
+        if not jobs:
+            self._really_close()
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Still working")
+        dlg.configure(bg="#111827")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text="⚠️  The app is still working", bg="#111827", fg="#fbbf24", font=("Arial", 13, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
+        for title, detail in jobs:
+            tk.Label(dlg, text=title, bg="#111827", fg="#f8fafc", font=("Arial", 10, "bold"), anchor="w").pack(fill="x", padx=16)
+            tk.Label(dlg, text=detail, bg="#111827", fg="#94a3b8", font=("Arial", 9), wraplength=520, justify="left", anchor="w").pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(dlg, text="Episodes that already finished are kept — Shortmax, Narto Claude, TikTok lists and the Queue continue from there next time.",
+                 bg="#111827", fg="#64748b", font=("Arial", 9, "italic"), wraplength=520, justify="left").pack(fill="x", padx=16, pady=(0, 10))
+        row = tk.Frame(dlg, bg="#111827")
+        row.pack(fill="x", padx=12, pady=(0, 14))
+
+        def keep():
+            dlg.destroy()
+
+        def stop_only():
+            dlg.destroy()
+            self._stop_everything()
+
+        def stop_and_quit():
+            dlg.destroy()
+            self._stop_everything()
+            self._close_when_idle(time.time())
+
+        def quit_now():
+            dlg.destroy()
+            self._really_close()
+        ttk.Button(row, text="↩ Keep Working", style="Success.TButton", command=keep).pack(side="left", padx=4)
+        ttk.Button(row, text="⏹ Stop (stay open)", command=stop_only).pack(side="left", padx=4)
+        ttk.Button(row, text="⏹ Stop, Save & Quit", style="Accent.TButton", command=stop_and_quit).pack(side="left", padx=4)
+        ttk.Button(row, text="✖ Quit Now", style="Danger.TButton", command=quit_now).pack(side="left", padx=4)
+        if getattr(self, "_theme_now", "dark") == "light":
+            self._remap_tree(dlg, True)
+        dlg.protocol("WM_DELETE_WINDOW", keep)
+        dlg.bind("<Escape>", lambda e: keep())
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        self._close_dialog = dlg
+
+    def _stop_everything(self):
+        if getattr(self, "_queue_running", False):
+            self._queue_pause_req = True
+        self.stop_download()
+        self.sync_stop_flag = True
+        if self.sync_process is not None:
+            try: self.sync_process.terminate()
+            except Exception: pass
+
+    def _close_when_idle(self, started):
+        """After Stop: let the finished episodes be merged (up to 10 min), then close."""
+        busy = str(self.stop_btn.cget("state")) == "normal" or getattr(self, "_queue_running", False)
+        if not busy or time.time() - started > 600:
+            self._really_close()
+            return
+        self.update_status("Stopping… saving the finished episodes, then the app closes by itself.", "orange")
+        self.root.after(500, lambda: self._close_when_idle(started))
+
+    def _really_close(self):
         self.save_settings()
         self.stop_flag = True
         self.sync_stop_flag = True
@@ -5025,6 +5117,10 @@ class DownloaderApp:
         ("Choose Image", "Choose image", "Pick a picture from your computer to search with."),
         ("Paste Image", "Paste image", "Uses the picture you copied (e.g. a screenshot) to search."),
         ("Search Everywhere", "Search", "Searches every ticked site for the name and compares their posters with your picture."),
+        ("Keep Working", "Keep working", "Closes this message; the download continues."),
+        ("Stop (stay open)", "Stop", "Stops the download but keeps the app open. Finished episodes are merged."),
+        ("Stop, Save & Quit", "Stop, save & quit", "Stops, merges the episodes that already finished, then closes the app by itself."),
+        ("Quit Now", "Quit now", "Closes immediately. Finished episodes stay on disk and resume next time."),
         ("▶ Open", "Open", "Opens the play page of this result in your browser."),
         ("Notify me", "Notifications", "Shows a desktop notification when a download finishes."),
         ("Frame", "Step one frame", "Moves exactly one video frame back or forward — for finding the perfect cut point."),
