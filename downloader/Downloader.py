@@ -1,6 +1,7 @@
 import os, sys, subprocess, re, threading, urllib.parse, webbrowser, datetime, time, shutil, copy
 import json, math
 import urllib.request
+import urllib.error
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
@@ -348,8 +349,38 @@ def write_srt(cues, path):
             fh.write(f"{i}\n{f(st)} --> {f(en)}\n{body}\n\n")
 
 
+def _gtx_get(url, tries=5):
+    """GET with patience: the free translation service sometimes answers 429 (too many requests) — wait and retry."""
+    delay = 3
+    for k in range(tries):
+        try:
+            return json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30).read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and k < tries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+
+
+def _argos_translate(lines, target):
+    """Offline fallback (free): pip install argostranslate + the language package."""
+    import argostranslate.translate as at
+    return [at.translate(t, "en", target) for t in lines]
+
+
 def translate_lines(lines, target="ar", progress=None):
-    """Free web translation (Google gtx endpoint), in batches. Returns the translated lines (same count)."""
+    """Free web translation (Google gtx endpoint), in batches; waits and retries when busy, then tries offline Argos."""
+    try:
+        return _translate_lines_web(lines, target, progress)
+    except Exception as web_err:
+        try:
+            return _argos_translate(lines, target)
+        except Exception:
+            raise web_err
+
+
+def _translate_lines_web(lines, target="ar", progress=None):
     out = []
     sep = "\n"
     i = 0
@@ -364,15 +395,14 @@ def translate_lines(lines, target="ar", progress=None):
             i += 1
         q = urllib.parse.quote(sep.join(batch))
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={q}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        data = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+        data = _gtx_get(url)
         text = "".join(seg[0] for seg in data[0] if seg and seg[0])
         parts = text.split("\n")
         if len(parts) != len(batch):      # rare: the service merged lines — translate this batch one by one
             parts = []
             for line in batch:
                 u = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={urllib.parse.quote(line)}"
-                d = json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=30).read().decode("utf-8"))
+                d = _gtx_get(u)
                 parts.append("".join(seg[0] for seg in d[0] if seg and seg[0]))
         out += [p.strip() for p in parts]
         if progress:
@@ -771,7 +801,7 @@ class NaderPlayer:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.4"
+        self.version = "v1.9.5"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -846,12 +876,13 @@ class DownloaderApp:
             ("home", "🏠 Home"),
             ("dlqueue", "📋 Queue"),
             ("library", "📚 Library"),
+            ("history", "🕘 History"),
             ("find", "🔍 Find"),
             ("sync", "🎙️ Sync"),
             ("manual_edit", "🎛️ Edit"),
             ("queue", "🌙 Narto 5"),
             ("trim_crop", "✂️ Trim"),
-            ("settings", "⚙️ Settings"),
+            ("settings", "⚙️"),
         ]
         for key, label in nav_items:
             b = self.make_3d_pill(nav_pills, label, lambda k=key: self.show_page(k))
@@ -1067,7 +1098,7 @@ class DownloaderApp:
 
     def make_3d_pill(self, parent, text, command, kind="dark", bg="#111827"):
         f = tkfont.Font(family="Arial", size=9, weight="bold")
-        w = f.measure(text) + 18
+        w = f.measure(text) + 16
 
         class LazyImgs(dict):
             # Each state image is rendered the first time it is shown
@@ -1136,6 +1167,7 @@ class DownloaderApp:
             "dlqueue": "📋 Download Queue (runs overnight, resumes after restart)",
             "library": "📚 Library — everything you downloaded",
             "settings": "⚙️ Settings & Engine Health",
+            "history": "🕘 Download History — what you downloaded, from where, which episodes",
             "find": "🔍 Find by Image — upload a picture, get the series and its direct links",
         }
         self.header_title_lbl.config(text=titles.get(page_name, "🎬 Nader Video Studio"))
@@ -1162,6 +1194,8 @@ class DownloaderApp:
             self._remap_tree(self.pages[page_name], True)   # widgets made since the theme switch
         if page_name == "library":
             self.refresh_library()
+        if page_name == "history":
+            self.refresh_history()
         if page_name == "settings" and not self.health_tree.get_children():
             self.refresh_health()
 
@@ -5005,6 +5039,8 @@ class DownloaderApp:
                                      "resume where they stopped, can run only at night, and can notify you or shut the PC down when finished."),
         "📚 Library": ("Library", "All your finished videos as posters, like a streaming app. Play them in Nader Player (voice-sync fix, "
                                  "Arabic subtitles), share them (AirDrop, Bluetooth, Blip) or delete them."),
+        "🕘 History": ("Download History", "One card per series: poster, site, how many episodes it has, which ones you already "
+                                         "downloaded (green bar) and when. 'Continue EP …' fills in the link and the next episode for you."),
         "🔍 Find": ("Find by Image", "Upload or paste a picture (poster, TikTok screenshot). The app reads the name, searches Narto, "
                                     "Dailymotion and YouTube, and shows posters that look the same plus titles with the same name — "
                                     "click one to open its play page in your browser."),
@@ -5014,7 +5050,7 @@ class DownloaderApp:
                                        "copy or mute each one alone, then save the full movie in the same HD quality."),
         "🌙 Narto 5": ("Narto 5-Movie Overnight Queue", "The original overnight queue for up to 5 Narto series, downloaded one by one."),
         "✂️ Trim": ("Trim & Crop HD", "Cut parts out of one or many videos, crop black bars or edges, and join the pieces in the order you choose."),
-        "⚙️ Settings": ("Settings & Health", "Theme, maximum quality, speed limit, notifications, save folder, and the status of every engine "
+        "⚙️": ("Settings & Health", "Theme, maximum quality, speed limit, notifications, save folder, and the status of every engine "
                                             "(yt-dlp, FFmpeg, aria2c). Includes one-click Update yt-dlp."),
         "🌓": ("Theme: Auto", "Follows your computer's dark/light setting. Click to switch to Dark, again for Light."),
         "🌙": ("Theme: Dark", "Dark colours. Click to switch to Light."),
@@ -5114,6 +5150,11 @@ class DownloaderApp:
         ("Update yt-dlp", "Update yt-dlp", "Updates the download engine and its browser-impersonation part. Fixes most 'it stopped working' problems."),
         ("Check Again", "Check engines", "Checks again which engines are installed and working."),
         ("Change Folder", "Save folder", "Choose where finished videos are saved."),
+        ("Continue EP", "Continue", "Puts this series' link and the next missing episode into the right download tab — just press Download."),
+        ("🌐 Page", "Open page", "Opens the series page in your browser."),
+        ("Narto-Drama (all providers)", "Search Narto", "Searches narto-drama.com, which lists series from PineDrama, ReelShort, FlareFlow, FreeReels and more."),
+        ("YouTube", "Search YouTube", "Also searches YouTube for the same name."),
+        ("Google", "Google Images", "Opens a Google Images search for the name in your browser."),
         ("Choose Image", "Choose image", "Pick a picture from your computer to search with."),
         ("Paste Image", "Paste image", "Uses the picture you copied (e.g. a screenshot) to search."),
         ("Search Everywhere", "Search", "Searches every ticked site for the name and compares their posters with your picture."),
@@ -5577,6 +5618,7 @@ class DownloaderApp:
     def build_extra_pages(self):
         self.build_dl_queue_page()
         self.build_library_page()
+        self.build_history_page()
         self.build_find_page()
         self.build_settings_page()
 
@@ -5887,6 +5929,9 @@ class DownloaderApp:
         self._on_main(prep)
         self.log_message(f"{'='*50}\n--- QUEUE JOB: {job['type']} ---\n{job['url']}")
         self._current_dl_url = job["url"] if job["type"] not in ("tiktok_bulk", "torrent") else ""
+        self._current_dl_source = {"shortmax": 1, "narto": 2, "narto_claude": 7, "tiktok": 4, "dailymotion": 5, "direct": 3}.get(job["type"])
+        self._series_total_hint = None
+        self._run_stop_at = int(job["total"]) if str(job.get("total", "")).isdigit() else None
         t = job["type"]
         try:
             if t == "narto_claude":
@@ -5943,6 +5988,10 @@ class DownloaderApp:
             m["url"] = url
         m.setdefault("added", time.time())
         self.save_lib_meta()
+        try:
+            self.history_note(path, m.get("url", ""), getattr(self, "_current_dl_source", None), getattr(self, "_series_total_hint", None))
+        except Exception as e:
+            self.log_message(f"History: {e}")
         threading.Thread(target=self.ensure_poster, args=(path, True), daemon=True).start()
 
     def library_title(self, path):
@@ -6750,6 +6799,303 @@ $res.Lines | ForEach-Object { $_.Text }
                                        "🔤 Name matches — titles like the name in your picture\n\nClick any result to open its play page in your browser.",
                  bg="#0b0f19", fg="#64748b", font=("Arial", 11), justify="left").pack(anchor="w", padx=20, pady=40)
 
+
+    # =========================================================================
+    # 🕘 HISTORY (v1.9.5): one card per series — poster, site, which episodes you have, continue button
+    # =========================================================================
+    SITE_STYLE = {"Narto": ("#a855f7", "🟣"), "Shortmax": ("#f97316", "🟠"), "TikTok": ("#10b981", "🟢"),
+                  "Dailymotion": ("#38bdf8", "🔵"), "YouTube": ("#f43f5e", "🔴"), "Torrent": ("#eab308", "🟡"), "Direct": ("#64748b", "⚪")}
+    SOURCE_TAB = {1: ("url_entry1", 0), 2: ("url_entry2", 1), 7: ("url_entry7", 2), 5: ("url_entry5", 3), 4: ("url_entry4", 4), 3: ("url_entry3", 5)}
+
+    def load_dl_history(self):
+        self.dl_history_path = os.path.join(self.base_dir, "download_history.json")
+        try:
+            with open(self.dl_history_path, "r", encoding="utf-8") as f:
+                self.dl_history = json.load(f)
+        except Exception:
+            self.dl_history = {}
+        if not self.dl_history:
+            self._seed_history_from_library()
+
+    def save_dl_history(self):
+        try:
+            with open(self.dl_history_path, "w", encoding="utf-8") as f:
+                json.dump(self.dl_history, f, indent=1, ensure_ascii=False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def site_of(url="", filename=""):
+        h = (url or "").lower()
+        fn = (filename or "").lower()
+        for key, site in (("narto", "Narto"), ("shortmax", "Shortmax"), ("shorttw", "Shortmax"), ("tiktok", "TikTok"),
+                          ("dailymotion", "Dailymotion"), ("dai.ly", "Dailymotion"), ("youtu", "YouTube"), ("magnet:", "Torrent"),
+                          (".torrent", "Torrent")):
+            if key in h:
+                return site
+        for key, site in (("narto_", "Narto"), ("shortmax", "Shortmax"), ("tiktok", "TikTok"), ("dailymotion", "Dailymotion")):
+            if key in fn:
+                return site
+        return "Direct"
+
+    @staticmethod
+    def episode_range(filename):
+        """(from, to, is_full) from names like Series_EP3-EP40.mp4 / Series_EP7.mp4 / Series_Full.mp4."""
+        m = re.search(r"_EP(\d+)-EP(\d+)", filename, re.I)
+        if m:
+            return int(m.group(1)), int(m.group(2)), False
+        m = re.search(r"_EP(\d+)(?:_|\.|$)", filename, re.I)
+        if m:
+            return int(m.group(1)), int(m.group(1)), False
+        if re.search(r"_Full", filename, re.I):
+            return 1, None, True
+        return None, None, False
+
+    def _history_key(self, url, title):
+        k = self._norm_key(self.series_key_from_url(url)) if url else ""
+        return k if len(k) >= 3 else self._norm_key(title)
+
+    def history_note(self, path, url="", source=None, total=None):
+        """Adds a finished file to the history of its series."""
+        if not hasattr(self, "dl_history"):
+            return
+        fn = os.path.basename(path)
+        title = self.library_title(path)
+        key = self._history_key(url, title)
+        if not key:
+            return
+        a, b, full = self.episode_range(fn)
+        if full:   # "Full" = from EP 1 to where this run was told to stop (or the end of the series)
+            stop = getattr(self, "_run_stop_at", None)
+            b = min(stop, total) if (stop and total) else (stop or total)
+        e = self.dl_history.setdefault(key, {"title": title, "site": self.site_of(url, fn), "url": url, "source": source,
+                                             "total": None, "ranges": [], "files": [], "first": time.time()})
+        if url and not e.get("url"):
+            e["url"] = url
+        if source and not e.get("source"):
+            e["source"] = source
+        if total:
+            e["total"] = max(int(total), e.get("total") or 0)
+        if a is not None and b is not None:
+            e["ranges"].append([a, b])
+        elif full and a == 1 and not total:
+            e["full_unknown"] = True
+        ap = os.path.abspath(path)
+        if ap not in e["files"]:
+            e["files"].append(ap)
+        e["last"] = time.time()
+        e["last_file"] = ap
+        self.save_dl_history()
+        if self.current_page_name == "history":
+            self.root.after(0, self.refresh_history)
+
+    def _seed_history_from_library(self):
+        try:
+            for it in self._lib_files():
+                m = self.lib_meta.get(it["path"], {})
+                self.history_note(it["path"], m.get("url", ""))
+                e = self.dl_history.get(self._history_key(m.get("url", ""), self.library_title(it["path"])))
+                if e:
+                    e["last"] = e["first"] = it["mtime"]
+        except Exception:
+            pass
+
+    @staticmethod
+    def merge_ranges(ranges):
+        out = []
+        for a, b in sorted((min(a, b), max(a, b)) for a, b in ranges):
+            if out and a <= out[-1][1] + 1:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return out
+
+    # ------------------------------------------------------------------- page
+    def build_history_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["history"] = page
+        self.load_dl_history()
+        top = tk.Frame(page, bg="#0b0f19")
+        top.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(top, text="🕘 Download History", font=("Arial", 16, "bold"), bg="#0b0f19", fg="#f8fafc").pack(side="left")
+        self.hist_summary = tk.Label(top, text="", font=("Arial", 9, "bold"), bg="#0b0f19", fg="#94a3b8")
+        self.hist_summary.pack(side="left", padx=12)
+        self.hist_filter = tk.StringVar(value="All")
+        fc = ttk.Combobox(top, textvariable=self.hist_filter, values=["All", "Not finished", "Complete"] + list(self.SITE_STYLE),
+                          state="readonly", width=14)
+        fc.pack(side="right", padx=4)
+        fc.bind("<<ComboboxSelected>>", lambda e: self.refresh_history())
+        self.hist_search = ttk.Entry(top, width=24)
+        self.hist_search.pack(side="right", padx=4)
+        self.hist_search.bind("<KeyRelease>", lambda e: self.refresh_history())
+        tk.Label(top, text="🔎", bg="#0b0f19", fg="#94a3b8").pack(side="right")
+        wrap = tk.Frame(page, bg="#0b0f19")
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.hist_canvas = tk.Canvas(wrap, bg="#0b0f19", highlightthickness=0)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.hist_canvas.yview)
+        self.hist_canvas.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        self.hist_canvas.pack(side="left", fill="both", expand=True)
+        self.hist_inner = tk.Frame(self.hist_canvas, bg="#0b0f19")
+        self._hist_win = self.hist_canvas.create_window(0, 0, window=self.hist_inner, anchor="nw")
+        self.hist_inner.bind("<Configure>", lambda e: self.hist_canvas.configure(scrollregion=self.hist_canvas.bbox("all")))
+        self.hist_canvas.bind("<Configure>", lambda e: (self.hist_canvas.itemconfigure(self._hist_win, width=e.width), self._hist_relayout(e.width)))
+        self._hist_cols = 0
+        self._hist_imgs = []
+
+    def _hist_scroll_bind(self, w):
+        w.bind("<MouseWheel>", lambda e: self.hist_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"), add="+")
+        w.bind("<Button-4>", lambda e: self.hist_canvas.yview_scroll(-3, "units"), add="+")
+        w.bind("<Button-5>", lambda e: self.hist_canvas.yview_scroll(3, "units"), add="+")
+
+    def _hist_relayout(self, width):
+        cols = max(1, (width - 10) // 560)
+        if cols != self._hist_cols:
+            self._hist_cols = cols
+            self.refresh_history()
+
+    def _hist_state(self, e):
+        rng = self.merge_ranges(e.get("ranges", []))
+        have = sum(b - a + 1 for a, b in rng)
+        total = e.get("total")
+        last = max((b for a, b in rng), default=0)
+        if total:
+            complete = have >= total
+            nxt = next((n for n in range(1, total + 1) if not any(a <= n <= b for a, b in rng)), None)
+        else:
+            complete = bool(e.get("full_unknown")) or e.get("site") in ("TikTok", "Dailymotion", "YouTube", "Torrent", "Direct")
+            nxt = None if complete else last + 1
+        return rng, have, total, complete, nxt
+
+    def refresh_history(self):
+        if not hasattr(self, "hist_inner"):
+            return
+        for w in self.hist_inner.winfo_children():
+            w.destroy()
+        self._hist_imgs = []
+        q = self.hist_search.get().strip().lower()
+        flt = self.hist_filter.get()
+        items = []
+        for key, e in self.dl_history.items():
+            st = self._hist_state(e)
+            if q and q not in e["title"].lower():
+                continue
+            if flt == "Not finished" and st[3]:
+                continue
+            if flt == "Complete" and not st[3]:
+                continue
+            if flt in self.SITE_STYLE and e.get("site") != flt:
+                continue
+            items.append((key, e, st))
+        items.sort(key=lambda t: -t[1].get("last", 0))
+        n_eps = sum(t[2][1] for t in items)
+        self.hist_summary.config(text=f"{len(items)} series  •  {n_eps} episodes downloaded")
+        cols = max(1, self._hist_cols or 2)
+        if not items:
+            tk.Label(self.hist_inner, text="Nothing here yet — every finished download is added automatically.", bg="#0b0f19",
+                     fg="#64748b", font=("Arial", 11)).grid(row=0, column=0, padx=20, pady=40, sticky="w")
+        for k, (key, e, st) in enumerate(items):
+            self._hist_card(key, e, st).grid(row=k // cols, column=k % cols, padx=8, pady=8, sticky="nw")
+        if getattr(self, "_theme_now", "dark") == "light":
+            self._remap_tree(self.hist_inner, True)
+
+    def _hist_card(self, key, e, st):
+        rng, have, total, complete, nxt = st
+        color, dot = self.SITE_STYLE.get(e.get("site"), ("#64748b", "⚪"))
+        card = tk.Frame(self.hist_inner, bg="#131b2e", highlightthickness=1, highlightbackground="#24324d", width=540, height=196)
+        card.grid_propagate(False)
+        card.pack_propagate(False)
+        f = e.get("last_file") if e.get("last_file") and os.path.exists(e.get("last_file")) else next((p for p in e.get("files", []) if os.path.exists(p)), "")
+        img = None
+        if f:
+            pp = self._poster_path(f)
+            if not os.path.exists(pp):
+                tried = self.__dict__.setdefault("_hist_poster_tried", set())
+                if f not in tried:
+                    tried.add(f)
+
+                    def make(f=f):
+                        if self.ensure_poster(f, False) and self.current_page_name == "history":
+                            self.root.after(0, self.refresh_history)
+                    threading.Thread(target=make, daemon=True).start()
+            else:
+                try:
+                    full = tk.PhotoImage(file=pp)
+                    img = full.subsample(max(1, full.height() // 180 + (1 if full.height() % 180 else 0)))
+                except Exception:
+                    img = None
+        self._hist_imgs.append(img)
+        pic = tk.Label(card, image=img, bg="#0b0f19", width=126 if img else 15, height=180 if img else 11,
+                       text="" if img else "🎬", fg="#475569", font=("Arial", 26))
+        pic.place(x=8, y=8)
+        x0 = 150
+        tk.Label(card, text=f" {e.get('site', 'Direct')} ", bg=color, fg="#ffffff", font=("Arial", 8, "bold")).place(x=x0, y=10)
+        if complete:
+            status_txt, status_col = "✅ Complete", "#10b981"
+        elif total:
+            status_txt, status_col = f"⏳ {total - have} episodes left", "#f59e0b"
+        else:
+            status_txt, status_col = "❔ Total not known", "#94a3b8"
+        tk.Label(card, text=status_txt, bg="#131b2e", fg=status_col, font=("Arial", 9, "bold")).place(x=x0 + 110, y=9)
+        tk.Label(card, text=e["title"][:44], bg="#131b2e", fg="#f8fafc", font=("Arial", 12, "bold"), anchor="w").place(x=x0, y=32, width=380)
+        # episode bar: green = episodes you have
+        bar = tk.Canvas(card, width=370, height=16, bg="#131b2e", highlightthickness=0)
+        bar.place(x=x0, y=62)
+        span = total or max([b for a, b in rng] + [1])
+        bar.create_rectangle(0, 2, 369, 14, fill="#1e293b", outline="#334155")
+        for a, b in rng:
+            x1 = int(368 * (a - 1) / span) + 1
+            x2 = max(x1 + 2, int(368 * b / span))
+            bar.create_rectangle(x1, 3, x2, 13, fill="#10b981", outline="")
+        if total:
+            ep_line = f"📺 {have} of {total} episodes"
+        elif rng:
+            ep_line = f"📺 {have} episode{'s' if have != 1 else ''} (total not known)"
+        else:
+            ep_line = "📺 1 video"
+        tk.Label(card, text=ep_line, bg="#131b2e", fg="#e2e8f0", font=("Arial", 10, "bold")).place(x=x0, y=82)
+        ranges = ", ".join(f"EP {a}" if a == b else f"EP {a}–{b}" for a, b in rng) if rng else "whole video"
+        tk.Label(card, text=f"✅ Downloaded: {ranges}"[:60], bg="#131b2e", fg="#94a3b8", font=("Arial", 9)).place(x=x0, y=104)
+        when = datetime.datetime.fromtimestamp(e.get("last", time.time())).strftime("%d %b %Y, %H:%M")
+        tk.Label(card, text=f"🕘 Last download: {when}", bg="#131b2e", fg="#94a3b8", font=("Arial", 9)).place(x=x0, y=124)
+        row = tk.Frame(card, bg="#131b2e")
+        row.place(x=x0 - 4, y=152)
+        if nxt and e.get("url"):
+            ttk.Button(row, text=f"⬇️ Continue EP {nxt}", style="Accent.TButton", command=lambda: self.history_continue(e, nxt)).pack(side="left", padx=2)
+        if f:
+            ttk.Button(row, text="▶ Play", command=lambda: self.play_video(f)).pack(side="left", padx=2)
+        if e.get("url"):
+            ttk.Button(row, text="🌐 Page", command=lambda: webbrowser.open(e["url"])).pack(side="left", padx=2)
+        ttk.Button(row, text="🗑", width=3, command=lambda: self.history_forget(key)).pack(side="left", padx=2)
+        if e.get("url"):
+            card._help = (e["title"], f"{e.get('site')} • {ep_line[2:]}\nDownloaded: {ranges}\n{e['url']}")
+        for w in [card, pic, bar] + list(card.winfo_children()):
+            self._hist_scroll_bind(w)
+        return card
+
+    def history_continue(self, e, next_ep):
+        src = e.get("source") or {"Narto": 7, "Shortmax": 1, "TikTok": 4, "Dailymotion": 5}.get(e.get("site"), 3)
+        attr, tab = self.SOURCE_TAB.get(src, ("url_entry3", 5))
+        entry = getattr(self, attr)
+        entry.delete(0, tk.END)
+        entry.insert(0, e["url"])
+        self.start_entry.delete(0, tk.END)
+        self.start_entry.insert(0, str(next_ep))
+        self.total_entry.delete(0, tk.END)
+        if e.get("total"):
+            self.total_entry.insert(0, str(e["total"]))
+        self.show_page("home")
+        try: self.home_tabs.select(tab)
+        except Exception: pass
+        self.update_status(f"Ready to continue “{e['title']}” from EP {next_ep} — press the Download button (or ➕ Add to Queue).", "green")
+
+    def history_forget(self, key):
+        e = self.dl_history.get(key)
+        if e and messagebox.askyesno("History", f"Remove “{e['title']}” from the history?\n\n(The video files are NOT deleted.)"):
+            self.dl_history.pop(key, None)
+            self.save_dl_history()
+            self.refresh_history()
+
     def find_choose_image(self):
         p = filedialog.askopenfilename(title="Choose a picture", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All", "*.*")])
         if p:
@@ -7474,6 +7820,9 @@ $res.Lines | ForEach-Object { $_.Text }
         if not self.confirm_not_duplicate(url):
             return
         self._current_dl_url = url
+        self._current_dl_source = source
+        self._series_total_hint = None
+        self._run_stop_at = int(self.total_entry.get()) if self.total_entry.get().strip().isdigit() else None
         self.save_to_history(source, url)
         self.disable_buttons_for_run()
 
@@ -7542,6 +7891,9 @@ $res.Lines | ForEach-Object { $_.Text }
         if not self.confirm_not_duplicate(url):
             return
         self._current_dl_url = url
+        self._current_dl_source = 7
+        self._series_total_hint = None
+        self._run_stop_at = int(self.total_entry.get()) if self.total_entry.get().strip().isdigit() else None
         self.save_to_history(7, url)
         try:
             workers = max(1, min(6, int(self.narto_claude_parallel_var.get())))
@@ -8302,6 +8654,8 @@ $res.Lines | ForEach-Object { $_.Text }
                 if full_ep_url not in page_meta["refresh_endpoints"]:
                     page_meta["refresh_endpoints"].append(full_ep_url)
 
+        if page_meta.get("playlist"):
+            self._series_total_hint = len(page_meta["playlist"])   # v1.9.5: for the History page
         return page_meta
 
     def collect_narto_candidates(self, narto_playlist, episode, direct_url=""):
