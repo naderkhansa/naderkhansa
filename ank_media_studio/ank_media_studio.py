@@ -1543,6 +1543,10 @@ class TimelineWidget(QWidget):
     context_Menu_Requested = pyqtSignal(QPoint, int, int, str)  # (global_pos, clicked_ms, seg_idx, lane_type)
     edge_Trim_Started = pyqtSignal()
     edge_Trim_Updated = pyqtSignal()
+    edge_Trim_Preview = pyqtSignal(int, str)      # (timeline ms of the edge being dragged, label) — live monitor preview
+    edge_Trim_Finished = pyqtSignal()
+    mark_Drag_Preview = pyqtSignal(int, str)      # (ms, "A"|"B") while a mark flag is dragged
+    mark_Blocked = pyqtSignal(str)                # tried to move a locked mark
 
     def __init__(self):
         super().__init__()
@@ -1555,8 +1559,11 @@ class TimelineWidget(QWidget):
         self.mark_a_ms = None
         self.mark_b_ms = None
         self.lock_tracks = True  # Locked by default so trimming video trims all audio stems with it
+        self.lock_a = False      # Mark A / Mark B can be locked independently
+        self.lock_b = False
 
         self._dragging_playhead = False
+        self._dragging_mark = None   # "A" or "B" while a mark flag is dragged
         # Edge-drag trimming state: (seg_idx, lane_type, 'left'|'right', last_x)
         self._edge_drag_state = None
         self.update_width()
@@ -1826,17 +1833,22 @@ class TimelineWidget(QWidget):
             painter.fillRect(QRect(x1, ruler_h, x2 - x1, self.height() - ruler_h), QColor(34, 211, 238, 50))
 
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        if self.mark_a_ms is not None:
-            xa = self.ms_to_x(self.mark_a_ms)
-            painter.setPen(QPen(QColor("#22D3EE"), 2))
-            painter.drawLine(xa, 0, xa, self.height())
-            painter.drawText(xa + 4, self.height() - 18, f"A  {format_ms(self.mark_a_ms)}")
-
-        if self.mark_b_ms is not None:
-            xb = self.ms_to_x(self.mark_b_ms)
-            painter.setPen(QPen(QColor("#F43F5E"), 2))
-            painter.drawLine(xb, 0, xb, self.height())
-            painter.drawText(xb + 4, self.height() - 5, f"B  {format_ms(self.mark_b_ms)}")
+        for name, ms, locked, col, text_y in (("A", self.mark_a_ms, self.lock_a, "#22D3EE", self.height() - 18),
+                                              ("B", self.mark_b_ms, self.lock_b, "#F43F5E", self.height() - 5)):
+            if ms is None:
+                continue
+            x = self.ms_to_x(ms)
+            painter.setPen(QPen(QColor(col), 3 if locked else 2, Qt.PenStyle.SolidLine if locked else Qt.PenStyle.DashLine))
+            painter.drawLine(x, 0, x, self.height())
+            # Draggable flag in the ruler (shows a padlock when locked)
+            flag = QRect(x - 1, 2, 30 if locked else 18, 16)
+            self._glossy(painter, flag, QColor(col), 4, QColor(col).lighter(150))
+            painter.setPen(QColor("#0b0f17"))
+            painter.drawText(QRect(x + 1, 2, 14, 16), Qt.AlignmentFlag.AlignCenter, name)
+            if locked:
+                painter.drawPixmap(x + 14, 3, make_icon_pixmap("lock", "amber", 14))
+            painter.setPen(QColor(col))
+            painter.drawText(x + 4, text_y, f"{name}  {format_ms(ms)}{'  LOCKED' if locked else ''}")
 
         # 4. Draw Playhead
         xp = self.ms_to_x(self.playhead_ms)
@@ -1849,6 +1861,37 @@ class TimelineWidget(QWidget):
     def x_to_ms_unclamped(self, x: int) -> int:
         return int(((x - 20) / self.px_per_sec) * 1000.0)
 
+    def _mark_at(self, pos: QPoint):
+        """'A' or 'B' when the press is on a mark flag in the ruler."""
+        if pos.y() > 32:
+            return None
+        for name, ms in (("B", self.mark_b_ms), ("A", self.mark_a_ms)):
+            if ms is not None and -4 <= pos.x() - self.ms_to_x(ms) <= 20:
+                return name
+        return None
+
+    def _seg_start_ms(self, idx: int) -> int:
+        return sum(s.duration_ms for s in self.segments[:idx])
+
+    def _emit_trim_preview(self, seg_idx: int, lane: str, edge: str):
+        """Tells the monitor which frame the dragged edge has reached, so you can stop on the exact picture."""
+        seg = self.segments[seg_idx]
+        start = self._seg_start_ms(seg_idx)
+        if self.lock_tracks or lane == "video":
+            if edge == "left":
+                # +1 ms: the exact boundary belongs to the previous clip
+                self.edge_Trim_Preview.emit(start + 1, f"TRIM START  ▸  first frame {format_ms(seg.in_ms)}")
+            else:
+                self.edge_Trim_Preview.emit(start + seg.duration_ms - 1, f"TRIM END  ▸  last frame {format_ms(seg.out_ms)}")
+        else:
+            am = seg.audio_mix
+            if edge == "left":
+                ms = start + am.stem_trim_start[lane]
+                self.edge_Trim_Preview.emit(ms + 1, f"{lane.upper()} STARTS  ▸  {format_ms(ms)}")
+            else:
+                ms = start + seg.duration_ms - am.stem_trim_end[lane] - 1
+                self.edge_Trim_Preview.emit(max(start, ms), f"{lane.upper()} ENDS  ▸  {format_ms(ms)}")
+
     def mousePressEvent(self, event):
         pos = event.pos()
         seg_idx, lane, edge = self._hit_test(pos)
@@ -1859,10 +1902,19 @@ class TimelineWidget(QWidget):
             return
 
         if event.button() == Qt.MouseButton.LeftButton:
+            mark = self._mark_at(pos)
+            if mark:
+                if (mark == "A" and self.lock_a) or (mark == "B" and self.lock_b):
+                    self.mark_Blocked.emit(mark)
+                else:
+                    self._dragging_mark = mark
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return
             if seg_idx >= 0 and edge in ("left", "right"):
                 # Start interactive edge-trimming
                 self.edge_Trim_Started.emit()
                 self._edge_drag_state = (seg_idx, lane, edge, pos.x())
+                self._emit_trim_preview(seg_idx, lane, edge)
                 return
 
             self._dragging_playhead = True
@@ -1872,11 +1924,23 @@ class TimelineWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.pos()
+        if self._dragging_mark:
+            ms = self.x_to_ms(pos.x())
+            if self._dragging_mark == "A":
+                self.mark_a_ms = ms
+            else:
+                self.mark_b_ms = ms
+            self.update()
+            self.mark_Drag_Preview.emit(ms, self._dragging_mark)
+            return
+
         if self._edge_drag_state is not None:
             seg_idx, lane, edge, last_x = self._edge_drag_state
             dx = pos.x() - last_x
-            delta_ms = int((dx / self.px_per_sec) * 1000.0)
-            if abs(delta_ms) >= 15 and 0 <= seg_idx < len(self.segments):
+            # Hold Shift for fine trimming (the clip edge moves 5x slower than the mouse)
+            fine = 0.2 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1.0
+            delta_ms = int((dx / self.px_per_sec) * 1000.0 * fine)
+            if abs(delta_ms) >= (3 if fine < 1 else 15) and 0 <= seg_idx < len(self.segments):
                 seg = self.segments[seg_idx]
                 # If locked OR dragging the video bar, trim whole clip + all stems together
                 if self.lock_tracks or lane == "video":
@@ -1901,6 +1965,7 @@ class TimelineWidget(QWidget):
                 self.update_width()
                 self.update()
                 self.edge_Trim_Updated.emit()
+                self._emit_trim_preview(seg_idx, lane, edge)
             return
 
         if self._dragging_playhead:
@@ -1909,16 +1974,28 @@ class TimelineWidget(QWidget):
             self.update()
             return
 
-        # Update hover cursor when near a trimmable left/right clip edge
+        # Update hover cursor when near a trimmable left/right clip edge or a mark flag
         seg_idx, lane, edge = self._hit_test(pos)
-        if seg_idx >= 0 and edge in ("left", "right"):
+        mark = self._mark_at(pos)
+        if mark:
+            locked = self.lock_a if mark == "A" else self.lock_b
+            self.setCursor(Qt.CursorShape.ForbiddenCursor if locked else Qt.CursorShape.SizeHorCursor)
+            self.setToolTip(f"Mark {mark} is locked — unlock it to move" if locked else f"Drag Mark {mark}")
+        elif seg_idx >= 0 and edge in ("left", "right"):
             self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self.setToolTip("Drag to trim  •  hold Shift for fine trimming")
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.setToolTip("")
 
     def mouseReleaseEvent(self, event):
         self._dragging_playhead = False
-        self._edge_drag_state = None
+        if self._dragging_mark:
+            self._dragging_mark = None
+            self.marks_Changed.emit(self.mark_a_ms, self.mark_b_ms)
+        if self._edge_drag_state is not None:
+            self._edge_drag_state = None
+            self.edge_Trim_Finished.emit()
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
@@ -2155,6 +2232,8 @@ class ANKMediaStudio(QMainWindow):
         sc("S", video_only(self._split_at_playhead_action))
         sc("[", video_only(self._set_mark_a))
         sc("]", video_only(self._set_mark_b))
+        sc("Ctrl+[", video_only(lambda: self._toggle_mark_lock("A")))
+        sc("Ctrl+]", video_only(lambda: self._toggle_mark_lock("B")))
         sc(Qt.Key.Key_Left, video_only(lambda: self._seek_relative(-self._frame_ms())))
         sc(Qt.Key.Key_Right, video_only(lambda: self._seek_relative(self._frame_ms())))
         sc("Shift+Left", video_only(lambda: self._seek_relative(-1000)))
@@ -2471,6 +2550,12 @@ class ANKMediaStudio(QMainWindow):
         btn_clear_marks = icon_button("Clear", "reset", "slate")
         btn_clear_marks.clicked.connect(self._clear_marks)
         lay.addLayout(self._row(btn_set_a, btn_set_b, btn_auto_mark, btn_clear_marks))
+        self.btn_lock_a = icon_button("Lock A", "unlock", "cyan", "Lock Mark A so it can't move (Ctrl+[). Play starts from a locked A.", checkable=True)
+        self.btn_lock_a.clicked.connect(lambda checked: self._toggle_mark_lock("A", checked))
+        self.btn_lock_b = icon_button("Lock B", "unlock", "rose", "Lock Mark B so it can't move (Ctrl+]). Play stops at a locked B.", checkable=True)
+        self.btn_lock_b.clicked.connect(lambda checked: self._toggle_mark_lock("B", checked))
+        lay.addLayout(self._row(self.btn_lock_a, self.btn_lock_b))
+        lay.addWidget(self._muted("Drag the A / B flags on the timeline ruler to move a mark — the monitor shows the exact frame live."))
         btn_del_mark = icon_button("Delete [A-B]", "trash", "red")
         btn_del_mark.clicked.connect(self._delete_marked_region)
         btn_trim_mark = icon_button("Keep Only [A-B]", "keep", "amber")
@@ -2773,7 +2858,12 @@ class ANKMediaStudio(QMainWindow):
         )
         self.timeline.context_Menu_Requested.connect(self._show_timeline_context_menu)
         self.timeline.edge_Trim_Started.connect(self._push_video_undo)
-        self.timeline.edge_Trim_Updated.connect(lambda: self._render_frame_at_ms(self.timeline.playhead_ms))
+        self.timeline.edge_Trim_Preview.connect(self._on_live_preview)
+        self.timeline.edge_Trim_Finished.connect(self._end_live_preview)
+        self.timeline.mark_Drag_Preview.connect(lambda ms, name: (self._on_live_preview(ms, f"MARK {name}  ▸  {format_ms(ms)}"),
+                                                                 self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)))
+        self.timeline.marks_Changed.connect(lambda a, b: self._end_live_preview())
+        self.timeline.mark_Blocked.connect(lambda name: self.status.showMessage(f"Mark {name} is locked — unlock it (Lock {name} button or Ctrl+{'[' if name == 'A' else ']'}) to move it."))
 
         self.timeline_scroll = QScrollArea()
         self.timeline_scroll.setWidgetResizable(True)
@@ -3623,10 +3713,8 @@ class ANKMediaStudio(QMainWindow):
     def _restore_video_snapshot(self, snap):
         segs, ma, mb, ph = snap
         self.timeline.segments = segs
-        self.timeline.mark_a_ms = ma
-        self.timeline.mark_b_ms = mb
+        self._assign_marks(ma, mb)
         self.timeline.playhead_ms = min(ph, self.timeline.total_duration_ms())
-        self._update_marks_label(ma, mb)
         self.timeline.update_width()
         self.timeline.update()
         self._sync_video_transform_ui(self._get_active_video_segment())
@@ -3767,6 +3855,10 @@ class ANKMediaStudio(QMainWindow):
         act("marker", "cyan", f"Set Mark A here ({format_ms(clicked_ms)})   [", self._set_mark_a)
         act("marker", "rose", f"Set Mark B here ({format_ms(clicked_ms)})   ]", self._set_mark_b)
         act("reset", "slate", "Clear Mark A & Mark B", self._clear_marks)
+        act("unlock" if self.timeline.lock_a else "lock", "cyan", "Unlock Mark A" if self.timeline.lock_a else "Lock Mark A   (Ctrl+[)",
+            lambda: self._toggle_mark_lock("A"))
+        act("unlock" if self.timeline.lock_b else "lock", "rose", "Unlock Mark B" if self.timeline.lock_b else "Lock Mark B   (Ctrl+])",
+            lambda: self._toggle_mark_lock("B"))
         menu.addSeparator()
         act("split", "orange", "Split clip here (S)", self._split_at_playhead_action)
         act("copy", "sky", "Copy [Mark A-B] or active clip (Ctrl+C)", self._copy_marked_or_active_clip)
@@ -3844,10 +3936,9 @@ class ANKMediaStudio(QMainWindow):
             self.status.showMessage(f"Restored full duration for {stem_key.title()} stem.")
 
     def _clear_marks(self):
-        self.timeline.mark_a_ms = None
-        self.timeline.mark_b_ms = None
-        self._update_marks_label(None, None)
-        self.timeline.update()
+        self._assign_marks(None, None)
+        if self.timeline.lock_a or self.timeline.lock_b:
+            self.status.showMessage("Cleared the unlocked mark(s). Locked marks stay until you unlock them.")
 
     def _split_at_playhead_action(self):
         if not self.timeline.segments:
@@ -4146,11 +4237,8 @@ class ANKMediaStudio(QMainWindow):
 
         new_marked_duration = sum(s.duration_ms for s in marked_segs)
         self.timeline.segments = left + marked_segs + right
-        self.timeline.mark_a_ms = m1
-        self.timeline.mark_b_ms = m1 + new_marked_duration
+        self._assign_marks(m1, m1 + new_marked_duration)
         self.timeline.playhead_ms = m1
-
-        self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
         self.timeline.update_width()
         self.timeline.update()
         self._render_frame_at_ms(m1)
@@ -4396,23 +4484,76 @@ class ANKMediaStudio(QMainWindow):
         self._apply_video_fades()
 
     def _set_mark_a(self):
+        if self.timeline.lock_a:
+            self.status.showMessage("Mark A is locked — unlock it first (Lock A button or Ctrl+[).")
+            return
         self.timeline.mark_a_ms = self.timeline.playhead_ms
-        if self.timeline.mark_b_ms is not None and self.timeline.mark_b_ms < self.timeline.mark_a_ms:
-            self.timeline.mark_a_ms, self.timeline.mark_b_ms = self.timeline.mark_b_ms, self.timeline.mark_a_ms
+        b = self.timeline.mark_b_ms
+        if b is not None and b < self.timeline.mark_a_ms and not self.timeline.lock_b:
+            self.timeline.mark_a_ms, self.timeline.mark_b_ms = b, self.timeline.mark_a_ms
         self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
         self.timeline.update()
 
     def _set_mark_b(self):
+        if self.timeline.lock_b:
+            self.status.showMessage("Mark B is locked — unlock it first (Lock B button or Ctrl+]).")
+            return
         self.timeline.mark_b_ms = self.timeline.playhead_ms
-        if self.timeline.mark_a_ms is not None and self.timeline.mark_b_ms < self.timeline.mark_a_ms:
-            self.timeline.mark_a_ms, self.timeline.mark_b_ms = self.timeline.mark_b_ms, self.timeline.mark_a_ms
+        a = self.timeline.mark_a_ms
+        if a is not None and self.timeline.mark_b_ms < a and not self.timeline.lock_a:
+            self.timeline.mark_a_ms, self.timeline.mark_b_ms = self.timeline.mark_b_ms, a
         self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
         self.timeline.update()
 
+    def _assign_marks(self, a, b):
+        """Sets the marks after an edit, leaving any locked mark exactly where it is."""
+        total = self.timeline.total_duration_ms()
+        if self.timeline.lock_a and self.timeline.mark_a_ms is not None:
+            a = min(self.timeline.mark_a_ms, total)
+        if self.timeline.lock_b and self.timeline.mark_b_ms is not None:
+            b = min(self.timeline.mark_b_ms, total)
+        self.timeline.mark_a_ms, self.timeline.mark_b_ms = a, b
+        self._update_marks_label(a, b)
+        self.timeline.update()
+
+    def _toggle_mark_lock(self, name: str, checked: bool = None):
+        tl = self.timeline
+        locked = (not (tl.lock_a if name == "A" else tl.lock_b)) if checked is None else bool(checked)
+        if locked and (tl.mark_a_ms if name == "A" else tl.mark_b_ms) is None:
+            # Locking a mark that isn't set yet places it at the playhead first
+            if name == "A":
+                tl.mark_a_ms = tl.playhead_ms
+            else:
+                tl.mark_b_ms = tl.playhead_ms
+        if name == "A":
+            tl.lock_a = locked
+        else:
+            tl.lock_b = locked
+        btn = self.btn_lock_a if name == "A" else self.btn_lock_b
+        btn.setChecked(locked)
+        btn.setText(f"{'Unlock' if locked else 'Lock'} {name}")
+        btn.setIcon(make_icon("lock" if locked else "unlock", "amber" if locked else ("cyan" if name == "A" else "rose")))
+        self._update_marks_label(tl.mark_a_ms, tl.mark_b_ms)
+        tl.update()
+        if name == "A":
+            self.status.showMessage("Mark A locked — Play now starts from Mark A." if locked else "Mark A unlocked — Play starts from the playhead again.")
+        else:
+            self.status.showMessage("Mark B locked — Play now stops at Mark B." if locked else "Mark B unlocked — Play runs to the end again.")
+
     def _update_marks_label(self, a, b):
-        str_a = format_ms(a) if a is not None else "--:--.---"
-        str_b = format_ms(b) if b is not None else "--:--.---"
+        str_a = (format_ms(a) if a is not None else "--:--.---") + ("  [LOCKED]" if self.timeline.lock_a else "")
+        str_b = (format_ms(b) if b is not None else "--:--.---") + ("  [LOCKED]" if self.timeline.lock_b else "")
         self.lbl_marks_info.setText(f"Mark A: {str_a}   |   Mark B: {str_b}")
+
+    def _on_live_preview(self, ms: int, label: str):
+        """While trimming or dragging a mark, the monitor shows the exact frame reached."""
+        self.video_Canvas.overlay_label = label
+        self._render_frame_at_ms(max(0, int(ms)))
+        self.lbl_time_counter.setText(f"{format_ms(ms)} / {format_ms(self.timeline.total_duration_ms())}")
+
+    def _end_live_preview(self):
+        self.video_Canvas.overlay_label = ""
+        self._render_frame_at_ms(min(self.timeline.playhead_ms, self.timeline.total_duration_ms()))
 
     def _auto_mark_scene(self):
         if not self.timeline.segments:
@@ -4420,10 +4561,7 @@ class ANKMediaStudio(QMainWindow):
         acc = 0
         for seg in self.timeline.segments:
             if acc <= self.timeline.playhead_ms <= acc + seg.duration_ms:
-                self.timeline.mark_a_ms = acc
-                self.timeline.mark_b_ms = acc + seg.duration_ms
-                self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
-                self.timeline.update()
+                self._assign_marks(acc, acc + seg.duration_ms)
                 return
             acc += seg.duration_ms
 
@@ -4444,10 +4582,8 @@ class ANKMediaStudio(QMainWindow):
         left, rest = self._split_segments_at_ms(self.timeline.segments, m1)
         _, right = self._split_segments_at_ms(rest, m2 - m1)
         self.timeline.segments = left + right
-        self.timeline.mark_a_ms = None
-        self.timeline.mark_b_ms = None
+        self._assign_marks(None, None)
         self.timeline.playhead_ms = min(m1, self.timeline.total_duration_ms())
-        self._update_marks_label(None, None)
         self.timeline.update_width()
         self.timeline.update()
         self._render_frame_at_ms(self.timeline.playhead_ms)
@@ -4459,10 +4595,8 @@ class ANKMediaStudio(QMainWindow):
         self._push_video_undo()
         m1, m2 = marks
         self.timeline.segments = self._extract_range_segments(m1, m2)
-        self.timeline.mark_a_ms = 0
-        self.timeline.mark_b_ms = self.timeline.total_duration_ms()
+        self._assign_marks(0, self.timeline.total_duration_ms())
         self.timeline.playhead_ms = 0
-        self._update_marks_label(self.timeline.mark_a_ms, self.timeline.mark_b_ms)
         self.timeline.update_width()
         self.timeline.update()
         self._render_frame_at_ms(0)
@@ -4585,9 +4719,13 @@ class ANKMediaStudio(QMainWindow):
             return
         self.is_playing = not self.is_playing
         if self.is_playing:
-            if self.timeline.playhead_ms >= self.timeline.total_duration_ms() - 20:
-                self.timeline.playhead_ms = 0
-            self._play_start_ms = self.timeline.playhead_ms
+            tl = self.timeline
+            if tl.lock_a and tl.mark_a_ms is not None:
+                tl.playhead_ms = tl.mark_a_ms           # a locked A is always the start point
+            elif tl.playhead_ms >= tl.total_duration_ms() - 20 or (
+                    tl.lock_b and tl.mark_b_ms is not None and abs(tl.playhead_ms - tl.mark_b_ms) <= 40):
+                tl.playhead_ms = 0                      # at the end (or stopped at a locked B): start over
+            self._play_start_ms = tl.playhead_ms
             self._play_clock.start()
             self._start_preview_audio()
             self.play_timer.start()
@@ -4607,8 +4745,12 @@ class ANKMediaStudio(QMainWindow):
                 nxt = marks[0]
                 self._start_preview_audio(nxt)
         total = self.timeline.total_duration_ms()
-        if nxt >= total:
-            nxt = total
+        tl = self.timeline
+        stop_at = total
+        if tl.lock_b and tl.mark_b_ms is not None and tl.mark_b_ms > self._play_start_ms:
+            stop_at = min(total, tl.mark_b_ms)          # a locked B is the end point
+        if nxt >= stop_at:
+            nxt = stop_at
             self.timeline.playhead_ms = nxt
             self._toggle_playback()
         self.timeline.playhead_ms = nxt
