@@ -5911,22 +5911,39 @@ class DownloaderApp:
 
     # ----------------------------------------------------------------- share
     def _find_blip(self):
+        """Where Blip is. On Windows Blip is a Microsoft Store app: it must be started through its App ID
+        (like the Start menu does) — running its .exe directly crashes it (Java 'kernel32' error)."""
         if sys.platform == "win32":
+            try:
+                r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    "Get-StartApps | Where-Object { $_.Name -like '*Blip*' } | Select-Object -First 1 -ExpandProperty AppID"],
+                                   capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+                app_id = (r.stdout or "").strip()
+                if app_id:
+                    return "appid:" + app_id
+            except Exception:
+                pass
+            try:
+                r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    "Get-AppxPackage *Blip* | Select-Object -First 1 -ExpandProperty PackageFamilyName"],
+                                   capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+                fam = (r.stdout or "").strip()
+                if fam:
+                    return "appid:" + fam + "!App"
+            except Exception:
+                pass
             la = os.environ.get("LOCALAPPDATA", "")
             pf = os.environ.get("ProgramFiles", r"C:\Program Files")
             for c in (os.path.join(la, "Programs", "Blip", "Blip.exe"), os.path.join(la, "Programs", "blip", "Blip.exe"),
-                      os.path.join(la, "Blip", "Blip.exe"), os.path.join(pf, "Blip", "Blip.exe")):
+                      os.path.join(pf, "Blip", "Blip.exe")):
                 if os.path.isfile(c):
                     return c
-            start_menu = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
-            for root_dir, _, files in os.walk(start_menu):
-                for fn in files:
-                    if fn.lower().startswith("blip") and fn.lower().endswith(".lnk"):
-                        return os.path.join(root_dir, fn)
-        elif sys.platform == "darwin":
+            return ""
+        if sys.platform == "darwin":
             for c in ("/Applications/Blip.app", os.path.expanduser("~/Applications/Blip.app")):
                 if os.path.isdir(c):
                     return c
+            return ""
         return shutil.which("blip") or ""
 
     def _copy_file_to_clipboard(self, path):
@@ -5989,15 +6006,17 @@ class DownloaderApp:
             return
         try:
             self._copy_file_to_clipboard(path)
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", "-a", blip, path])
-            elif blip.lower().endswith(".lnk"):
-                os.startfile(blip)
-                self.open_last_local_folder(os.path.dirname(path))
+            if blip.startswith("appid:"):
+                # Same as clicking Blip in the Start menu (never pass the file: Store apps can't take it that way)
+                subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + blip[len("appid:"):]])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", blip])
             else:
-                subprocess.Popen([blip, path])
-                self.open_last_local_folder(os.path.dirname(path))
-            self.update_status("Blip opened — the video is copied: paste it (Ctrl+V) or drag it from the folder onto your phone in Blip.", "green")
+                subprocess.Popen([blip], cwd=os.path.dirname(blip) or None)
+            self.open_last_local_folder(os.path.dirname(path))
+            messagebox.showinfo("Blip", "Blip is opening, and the video is already copied.\n\n"
+                                        "In Blip choose your phone, then paste (Ctrl+V / ⌘V) — or drag the video from the folder "
+                                        "that just opened onto your phone in Blip.\n\n" + os.path.basename(path))
         except Exception as e:
             messagebox.showerror("Blip", str(e))
 
