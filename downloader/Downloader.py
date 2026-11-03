@@ -193,12 +193,12 @@ def render_sphere(master, size, color, bg):
         rows.append(row)
     return _rows_to_photo(master, rows)
 
-def render_check(master, size, on, color, bg, round_box=False):
+def render_check(master, size, on, color, bg, round_box=False, off=None):
     """3D checkbox (or radio dot when round_box) for ttk indicators."""
     if on:
         top, bot, edge = color, _hexc(_mix(_rgb(color), (0, 0, 0), 0.35)), _hexc(_mix(_rgb(color), (255, 255, 255), 0.3))
     else:
-        top, bot, edge = "#1e293b", "#0f172a", "#475569"
+        top, bot, edge = off or ("#1e293b", "#0f172a", "#475569")
     rows = render_glossy_rows(size, size, top, bot, edge, bg, radius=(size / 2.0 - 1 if round_box else 4), shadow=1)
     if on:
         for y in range(size):
@@ -271,17 +271,21 @@ def render_banner(master, w, h, left, mid, right):
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.8.0"
+        self.version = "v1.9.0"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
         self.root.configure(bg="#0b0f19")
 
-        # --- SETUP PRO DARK STUDIO THEME ---
+        # --- PORTABLE PATHING + SAVED SETTINGS ---
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.load_settings()
+        self._theme_now = "dark"
+        self._queue_running = False
+
+        # --- SETUP PRO STUDIO THEME (dark first; light / auto applied after the pages exist) ---
         self.setup_pro_theme()
 
-        # --- PORTABLE PATHING ---
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.output_base = os.path.join(self.base_dir, "Finished_Videos")
         self.log_file = os.path.join(self.output_base, "download_log.txt")
         self.history_file = os.path.join(self.base_dir, "link_history.json")
@@ -339,21 +343,30 @@ class DownloaderApp:
 
         self.nav_buttons = {}
         nav_items = [
-            ("home", "🏠 Dashboard"),
-            ("sync", "🎙️ Voice Sync"),
-            ("manual_edit", "🎛️ Full Manual Edit"),
-            ("queue", "🌙 5-Movie Queue"),
-            ("trim_crop", "✂️ Trim & Crop HD")
+            ("home", "🏠 Home"),
+            ("dlqueue", "📋 Queue"),
+            ("library", "📚 Library"),
+            ("sync", "🎙️ Sync"),
+            ("manual_edit", "🎛️ Edit"),
+            ("queue", "🌙 Narto 5"),
+            ("trim_crop", "✂️ Trim"),
+            ("settings", "⚙️ Settings"),
         ]
         for key, label in nav_items:
             b = self.make_3d_pill(nav_pills, label, lambda k=key: self.show_page(k))
             b.pack(side="left", padx=2, pady=8)
             self.nav_buttons[key] = b
+        self.theme_pill = self.make_3d_pill(nav_pills, {"auto": "🌓 Auto", "dark": "🌙 Dark", "light": "☀️ Light"}.get(self.settings.get("theme"), "🌓 Auto"),
+                                            self.cycle_theme)
+        self.theme_pill.pack(side="left", padx=(8, 2), pady=8)
 
         # Nav pills get space first; a long page title is clipped instead of pushing the pills off-screen
+        # v1.9.0: the page title gets its own slim bar so all navigation pills fit
         self.header_title_lbl.pack_forget()
-        self.header_title_lbl.config(anchor="w")
-        self.header_title_lbl.pack(side="left", padx=6, fill="x", expand=True)
+        self.title_bar = tk.Frame(self.root, bg="#0d1322", height=26)
+        self.title_bar.pack(side="top", fill="x")
+        self.header_title_lbl = tk.Label(self.title_bar, text="", font=("Arial", 10, "bold"), bg="#0d1322", fg="#cbd5e1", anchor="w")
+        self.header_title_lbl.pack(side="left", padx=16, pady=3, fill="x", expand=True)
 
         # Main Page Container (All pages swap inside here — NO separate windows!)
         self.page_container = tk.Frame(self.root, bg="#0b0f19")
@@ -371,6 +384,10 @@ class DownloaderApp:
         self.build_full_manual_edit_page()
         self.build_narto_queue_page()
         self.build_trim_crop_page()
+        self.build_extra_pages()
+        self.apply_saved_settings()
+        self.apply_ui_theme(force=True)
+        self.root.after(20000, self._watch_os_theme)
 
         # Show Home Page Initially
         self.show_page("home", push_history=False)
@@ -580,6 +597,7 @@ class DownloaderApp:
         edge = _hexc(_mix(_rgb(color), (255, 255, 255), 0.45))
         img = render_glossy(self.root, size, size + 3, top, bot, edge, bg, radius=12, shadow=3)
         c._img3d = img
+        c._ank_badge = (color, size)
         c.create_image(0, 0, image=img, anchor="nw")
         c.create_text(size / 2 + 1, size / 2 + 1, text=glyph, fill="#0b0f19", font=("Arial", 17, "bold"))
         c.create_text(size / 2, size / 2, text=glyph, fill="#ffffff", font=("Arial", 17, "bold"))
@@ -611,7 +629,10 @@ class DownloaderApp:
             "sync": "🎙️ Voice & Subtitle Sync Studio (Quick Timer & Auto 2D Sync)",
             "manual_edit": "🎛️ Full Manual 3-Track Edit Studio (Space = Play/Pause • Hold Shift = ✋ Move Track)",
             "queue": "🌙 Narto Drama 5-Movie Overnight Queue (Sequential 1-by-1)",
-            "trim_crop": "✂️ HD Multi-Video Trim, Crop & Frame Scrubber Studio"
+            "trim_crop": "✂️ HD Multi-Video Trim, Crop & Frame Scrubber Studio",
+            "dlqueue": "📋 Download Queue (runs overnight, resumes after restart)",
+            "library": "📚 Library — everything you downloaded",
+            "settings": "⚙️ Settings & Engine Health",
         }
         self.header_title_lbl.config(text=titles.get(page_name, "🎬 Nader Video Studio"))
 
@@ -633,6 +654,13 @@ class DownloaderApp:
             if os.path.exists(auto_s):
                 self.sync_sub_var.set(auto_s)
 
+        if getattr(self, "_theme_now", "dark") == "light":
+            self._remap_tree(self.pages[page_name], True)   # widgets made since the theme switch
+        if page_name == "library":
+            self.refresh_library()
+        if page_name == "settings" and not self.health_tree.get_children():
+            self.refresh_health()
+
         if page_name == "manual_edit":
             cand_vid = self.sync_vid_var.get().strip() or self.last_output_file
             if cand_vid and os.path.exists(cand_vid) and not self.fme_v_path_var.get().strip():
@@ -647,6 +675,7 @@ class DownloaderApp:
             self.show_page("home", push_history=False)
 
     def on_app_close(self):
+        self.save_settings()
         self.stop_flag = True
         self.sync_stop_flag = True
         self.stop_fme_live_playback()
@@ -809,6 +838,7 @@ class DownloaderApp:
             variable=self.turbo_var, style="Card.TCheckbutton"
         )
         self.turbo_check.grid(row=0, column=4, padx=(18, 5))
+        ttk.Button(settings_frame, text="➕ Add to Queue", command=self.queue_add_current_dashboard).grid(row=0, column=5, padx=(12, 0))
 
         opts_row = ttk.Frame(settings_card, style="Card.TFrame")
         opts_row.pack(pady=2)
@@ -1493,10 +1523,11 @@ class DownloaderApp:
         prev_box = ttk.LabelFrame(page, text="2. Live Monitor & Fast Scrubber (Press SPACE to Play/Pause • Hold SHIFT to Grab & Slide Any Track)", padding=6)
         prev_box.pack(fill="x", padx=12, pady=3)
 
-        self.fme_frame_canvas = tk.Canvas(prev_box, width=310, height=174, bg="#070a12", highlightthickness=1, highlightbackground="#38bdf8")
+        _mw, _mh = self.FME_MONITOR_SIZES.get(self.settings.get("fme_monitor", "Small"), (310, 174))
+        self.fme_frame_canvas = tk.Canvas(prev_box, width=_mw, height=_mh, bg="#070a12", highlightthickness=1, highlightbackground="#38bdf8")
         self.fme_frame_canvas.grid(row=0, column=0, rowspan=4, padx=(4, 12), pady=2)
         self.fme_frame_canvas.create_text(
-            155, 87,
+            _mw // 2, _mh // 2,
             text="Load video to preview\n• Press SPACE to Play/Pause\n• Hold SHIFT to Drag Tracks",
             fill="#94a3b8", font=("Arial", 9, "bold"), justify="center"
         )
@@ -1542,14 +1573,23 @@ class DownloaderApp:
         for lbl_b, d_s in [("⏪ -5s", -5.0), ("-1s", -1.0), ("◀ -0.1s", -0.1), ("▶ +0.1s", 0.1), ("+1s", 1.0), ("⏩ +5s", 5.0)]:
             ttk.Button(ph_btn_row, text=lbl_b, width=7, command=lambda d=d_s: self.fme_step_playhead(d)).pack(side="left", padx=1)
 
+        # v1.9.0: second row keeps every control visible when the monitor is made bigger
+        ph_btn_row2 = ttk.Frame(scrub_ctrl, style="Card.TFrame")
+        ph_btn_row2.pack(fill="x", pady=(0, 3))
         ttk.Button(
-            ph_btn_row, text="🔍 Pop-Out", style="Accent.TButton",
+            ph_btn_row2, text="🔍 Pop-Out (F11 = full screen)", style="Accent.TButton",
             command=self.fme_toggle_popout
-        ).pack(side="left", padx=(10, 1))
+        ).pack(side="left", padx=(0, 1))
+        ttk.Label(ph_btn_row2, text="  🖥️ Monitor size:", background="#131b2e").pack(side="left")
+        self.fme_mon_size_var = tk.StringVar(value=self.settings.get("fme_monitor", "Small"))
+        mon_cb = ttk.Combobox(ph_btn_row2, textvariable=self.fme_mon_size_var, values=list(self.FME_MONITOR_SIZES),
+                              state="readonly", width=8)
+        mon_cb.pack(side="left", padx=(4, 1))
+        mon_cb.bind("<<ComboboxSelected>>", lambda e: self.fme_set_monitor_size(self.fme_mon_size_var.get()))
 
         self.fme_hand_lock_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
-            ph_btn_row, text="✋ Lock Hand Tool On", variable=self.fme_hand_lock_var,
+            ph_btn_row2, text="✋ Lock Hand Tool On", variable=self.fme_hand_lock_var,
             bg="#131b2e", fg="#fbbf24", selectcolor="#1e293b", font=("Arial", 9, "bold"),
             command=self.fme_update_hand_mode_ui
         ).pack(side="right", padx=4)
@@ -2079,7 +2119,7 @@ class DownloaderApp:
             seq = st["pop_seq"]
             temp_ppm = os.path.join(self.output_base, f"_temp_fme_popout_frame_{seq % 4}.ppm")
         else:
-            fw, fh = 310, 174
+            fw, fh = self.fme_monitor_dims()
             seq = 0
             temp_ppm = os.path.join(self.output_base, "_temp_fme_fast_frame.ppm")
 
@@ -2106,7 +2146,8 @@ class DownloaderApp:
                             img = tk.PhotoImage(file=temp_ppm)
                             st["photo"] = img
                             self.fme_frame_canvas.delete("all")
-                            self.fme_frame_canvas.create_image(155, 87, image=img)
+                            mw, mh = self.fme_monitor_dims()
+                            self.fme_frame_canvas.create_image(mw // 2, mh // 2, image=img)
                     except:
                         pass
                     st["rendering_frame"] = False
@@ -2123,6 +2164,33 @@ class DownloaderApp:
             return win is not None and bool(win.winfo_exists())
         except:
             return False
+
+
+    FME_MONITOR_SIZES = {"Small": (310, 174), "Medium": (420, 236), "Large": (540, 304)}
+
+    def fme_monitor_dims(self):
+        return self.FME_MONITOR_SIZES.get(self.settings.get("fme_monitor", "Small"), (310, 174))
+
+    def fme_set_monitor_size(self, name):
+        """Resizes the Full Manual Edit monitor (Pop-Out gives a free-size window)."""
+        if name not in self.FME_MONITOR_SIZES:
+            return
+        self.settings["fme_monitor"] = name
+        self.save_settings()
+        w, h = self.FME_MONITOR_SIZES[name]
+        self.fme_frame_canvas.config(width=w, height=h)
+        if not self.fme_popout_is_open():
+            self.fme_frame_canvas.delete("all")
+            self.fme_frame_canvas.create_text(w // 2, h // 2, text="…", fill="#94a3b8")
+            self.fme_request_preview_frame_throttled(self.fme_state["playhead"], force=True)
+        # A bigger monitor needs a taller window: maximise if the page no longer fits
+        self.root.update_idletasks()
+        page = self.pages.get("manual_edit")
+        if page is not None and page.winfo_reqheight() > self.page_container.winfo_height() + 4:
+            try:
+                self.root.state("zoomed") if sys.platform == "win32" else self.root.attributes("-zoomed", True)
+            except Exception:
+                self.root.geometry(f"{self.root.winfo_width()}x{min(self.root.winfo_screenheight() - 60, self.root.winfo_height() + page.winfo_reqheight() - self.page_container.winfo_height())}")
 
     def fme_toggle_popout(self):
         if self.fme_popout_is_open():
@@ -2201,7 +2269,7 @@ class DownloaderApp:
 
         self.fme_frame_canvas.delete("all")
         self.fme_frame_canvas.create_text(
-            155, 87, text="🔍 Showing in Pop-Out Monitor\n(close it to preview here again)",
+            self.fme_monitor_dims()[0] // 2, self.fme_monitor_dims()[1] // 2, text="🔍 Showing in Pop-Out Monitor\n(close it to preview here again)",
             fill="#38bdf8", font=("Arial", 9, "bold"), justify="center"
         )
         self.fme_popout_sync_play_btn()
@@ -3385,6 +3453,14 @@ class DownloaderApp:
         if file_path and os.path.exists(file_path):
             self.last_output_file = os.path.abspath(file_path)
             self.last_output_folder = os.path.dirname(self.last_output_file)
+            name = os.path.basename(self.last_output_file)
+            if not getattr(self, "_queue_running", False) and "_resume" not in self.last_output_file and not name.startswith(("temp", "_temp")) \
+                    and ".uniform" not in name and ".synclock" not in name and time.time() - getattr(self, "_last_notify", 0) > 5:
+                self._last_notify = time.time()
+                try:
+                    self.root.after(0, lambda n=name: self.notify("Download finished ✅", n))
+                except Exception:
+                    pass
 
     def find_newest_video_fallback(self):
         if self.last_output_file and os.path.exists(self.last_output_file):
@@ -3476,7 +3552,7 @@ class DownloaderApp:
             "ffmpeg", "-y", "-i", file_path,
             "-map", "0:v:0", "-map", "0:a:0?",
             "-c:v", "copy", "-video_track_timescale", "90000",
-            "-af", "aresample=async=1000:min_hard_comp=0.010000:first_pts=0,apad",
+            "-af", "aresample=async=1:min_hard_comp=0.010000:first_pts=0,apad",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-shortest", "-avoid_negative_ts", "make_zero", norm_path
         ]
@@ -3491,6 +3567,13 @@ class DownloaderApp:
         return file_path
 
     def concat_video_files_synced(self, file_list, final_output, normalize_first=False, status_prefix="Merging"):
+        """
+        v1.9.0 EXACT-SYNC MERGE.
+        Video is joined with a pure stream copy (bit-exact). Each episode's audio is rebuilt as lossless PCM that is
+        exactly as long as that episode's video and keeps its original offset to the picture, then the whole track is
+        encoded once. Tiny per-episode differences (AAC priming, HLS start offsets, short/long audio) can no longer add
+        up into drift. Falls back to the classic copy-merge if anything goes wrong.
+        """
         if normalize_first and self.sync_lock_var.get():
             total = len(file_list)
             for idx, fpath in enumerate(file_list, 1):
@@ -3498,25 +3581,233 @@ class DownloaderApp:
                     break
                 self.update_status(f"{status_prefix}: Sync-locking clip {idx}/{total}...", "#f59e0b")
                 self.normalize_clip_for_sync(fpath)
+        res = None
+        if self.sync_lock_var.get():
+            try:
+                res = self._concat_exact_sync(file_list, final_output, status_prefix)
+            except Exception as e:
+                self.log_message(f"Exact-sync merge error ({e}); using the classic merge.")
+                res = None
+            if res is not None and res.returncode != 0:
+                self.log_message(f"Exact-sync merge failed; using the classic merge.\n{(res.stderr or '')[-600:]}")
+                res = None
+        if res is None:
+            res = self._concat_copy_classic(file_list, final_output)
+        if res.returncode == 0 and os.path.exists(final_output):
+            self.record_last_output(final_output)
+            self.verify_merge_sync(final_output, file_list_count=len(file_list))
+        return res
 
+    def _concat_copy_classic(self, file_list, final_output):
         list_file = final_output + ".concat_list.txt"
         with open(list_file, "w", encoding="utf-8") as f:
             for vid in file_list:
                 f.write(f"file '{vid.replace(chr(92), '/')}'\n")
-
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", list_file, "-c", "copy",
-            "-movflags", "+faststart", "-avoid_negative_ts", "make_zero",
-            final_output
-        ]
-        res = self.run_ffmpeg(ffmpeg_cmd)
-        if os.path.exists(list_file):
-            try: os.remove(list_file)
-            except: pass
-        if res.returncode == 0 and os.path.exists(final_output):
-            self.record_last_output(final_output)
+        res = self.run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy",
+                               "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", final_output])
+        try: os.remove(list_file)
+        except: pass
         return res
+
+    def _stream_starts(self, path):
+        """(video start, audio start or None) in seconds, from ffprobe."""
+        ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+        if not ffprobe:
+            return 0.0, 0.0
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,start_time:stream_disposition=attached_pic",
+                            "-of", "json", path], capture_output=True, text=True, encoding="utf-8", errors="ignore", **kwargs)
+        vs, a_s = None, None
+        for st in json.loads(r.stdout or "{}").get("streams", []):
+            try:
+                t = float(st.get("start_time", 0) or 0)
+            except ValueError:
+                t = 0.0
+            if st.get("codec_type") == "video" and vs is None and not st.get("disposition", {}).get("attached_pic"):
+                vs = t
+            elif st.get("codec_type") == "audio" and a_s is None:
+                a_s = t
+        return (vs or 0.0), a_s
+
+    def _concat_exact_sync(self, file_list, final_output, status_prefix="Merging"):
+        work = final_output + ".parts"
+        os.makedirs(work, exist_ok=True)
+        v_parts, a_parts = [], []
+        try:
+            total = len(file_list)
+            for i, src in enumerate(file_list, 1):
+                if self.stop_flag:
+                    return None
+                self.update_status(f"{status_prefix}: exact-sync {i}/{total} (video copy + sample-exact audio)...", "#f59e0b")
+                vpart = os.path.join(work, f"v{i:04d}.mp4")
+                apart = os.path.join(work, f"a{i:04d}.wav")
+                r = self.run_ffmpeg(["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "copy",
+                                     "-video_track_timescale", "90000", "-avoid_negative_ts", "make_zero", vpart])
+                if r.returncode != 0 or not os.path.exists(vpart):
+                    return r
+                vdur = self.get_media_duration(vpart)
+                if vdur <= 0:
+                    return None
+                vs, a_s = self._stream_starts(src)
+                if a_s is None:
+                    cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo", "-t", f"{vdur:.6f}",
+                           "-c:a", "pcm_s16le", apart]
+                else:
+                    off = a_s - vs   # >0: sound starts after the picture, <0: sound starts before it
+                    chain = ["asetpts=PTS-STARTPTS", "aresample=48000:async=1:min_hard_comp=0.010000:first_pts=0"]
+                    if off > 0.0005:
+                        ms = int(round(off * 1000))
+                        chain.append(f"adelay={ms}|{ms}")
+                    elif off < -0.0005:
+                        chain += [f"atrim=start={-off:.6f}", "asetpts=PTS-STARTPTS"]
+                    chain += ["apad", f"atrim=end={vdur:.6f}", "asetpts=PTS-STARTPTS"]
+                    cmd = ["ffmpeg", "-y", "-i", src, "-map", "0:a:0", "-vn", "-af", ",".join(chain),
+                           "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", apart]
+                r = self.run_ffmpeg(cmd)
+                if r.returncode != 0 or not os.path.exists(apart):
+                    return r
+                v_parts.append(vpart)
+                a_parts.append(apart)
+            vlist, alist = os.path.join(work, "v.txt"), os.path.join(work, "a.txt")
+            for lst, parts in ((vlist, v_parts), (alist, a_parts)):
+                with open(lst, "w", encoding="utf-8") as f:
+                    for p in parts:
+                        f.write(f"file '{p.replace(chr(92), '/')}'\n")
+            self.update_status(f"{status_prefix}: joining {len(v_parts)} clip(s) with locked sound...", "#f59e0b")
+            return self.run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", vlist, "-f", "concat", "-safe", "0", "-i", alist,
+                                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                                    "-ac", "2", "-movflags", "+faststart", final_output])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    # ---------------------------------------------------- automatic sync check
+    def _stream_durations(self, path):
+        ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+        if not ffprobe:
+            return None, None
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "json", path],
+                           capture_output=True, text=True, encoding="utf-8", errors="ignore", **kwargs)
+        v = a = None
+        for st in json.loads(r.stdout or "{}").get("streams", []):
+            try:
+                d = float(st.get("duration"))
+            except (TypeError, ValueError):
+                continue
+            if st.get("codec_type") == "video" and v is None:
+                v = d
+            elif st.get("codec_type") == "audio" and a is None:
+                a = d
+        return v, a
+
+    def verify_merge_sync(self, final_output, file_list_count=0):
+        """Checks the merged file in the background: sound length = picture length, and (when an .srt is
+        saved next to it) that the voice lines up with the subtitles at the start and at the end."""
+        def work():
+            try:
+                v, a = self._stream_durations(final_output)
+                if v and a:
+                    diff = abs(v - a)
+                    ok = diff < 0.12
+                    self.log_message(f"Sync check: picture {v:.3f}s, sound {a:.3f}s → difference {diff * 1000:.0f} ms "
+                                     f"{'✅ in sync' if ok else '⚠️ lengths differ'} ({os.path.basename(final_output)})")
+                srt = os.path.splitext(final_output)[0] + ".srt"
+                for _ in range(40):      # the subtitles are written right after the merge
+                    if os.path.exists(srt) or self.stop_flag:
+                        break
+                    time.sleep(1.5)
+                if os.path.exists(srt):
+                    res = self.check_voice_vs_subtitles(final_output, srt)
+                    if res:
+                        self.log_message(res)
+            except Exception as e:
+                self.log_message(f"Sync check skipped: {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _srt_cues(path):
+        cues = []
+        try:
+            txt = open(path, "r", encoding="utf-8", errors="ignore").read()
+        except OSError:
+            return cues
+        for m in re.finditer(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)", txt):
+            g = [int(x) for x in m.groups()]
+            st = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
+            en = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+            if en > st:
+                cues.append((st, en))
+        return cues
+
+    def check_voice_vs_subtitles(self, video_path, srt_path, window_sec=420):
+        """Finds how far the voice is from the subtitles (best match of speech loudness vs. subtitle times)
+        near the start and near the end. Equal small offsets = no drift."""
+        cues = self._srt_cues(srt_path)
+        if len(cues) < 20:
+            return ""
+        dur = self.get_media_duration(video_path)
+        rate = 50  # loudness samples per second (20 ms)
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+
+        # Decode the sound continuously from the beginning, the way video players do (seeking would hide drift)
+        import array
+        step = 8000 // rate
+        full_env = []
+        proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", video_path, "-map", "0:a:0", "-ac", "1", "-ar", "8000",
+                                 "-af", "highpass=f=200,lowpass=f=3500", "-f", "s16le", "-"], stdout=subprocess.PIPE, **kwargs)
+        chunk_bytes = step * 2 * 500
+        rest = b""
+        while True:
+            data = proc.stdout.read(chunk_bytes)
+            if not data:
+                break
+            data = rest + data
+            usable = len(data) // (step * 2) * (step * 2)
+            rest = data[usable:]
+            pcm = array.array("h")
+            pcm.frombytes(data[:usable])
+            for k in range(0, len(pcm), step):
+                seg = pcm[k:k + step:4]
+                full_env.append(sum(map(abs, seg)) / max(1, len(seg)))
+        proc.wait()
+
+        def envelope(start, length):
+            return full_env[int(start * rate):int((start + length) * rate)]
+
+        def best_lag(start, length):
+            env = envelope(start, length)
+            if len(env) < rate * 30:
+                return None
+            srt_mask = [0.0] * len(env)
+            for st, en in cues:
+                a, b = int((st - start) * rate), int((en - start) * rate)
+                for k in range(max(0, a), min(len(env), b)):
+                    srt_mask[k] = 1.0
+            idx = [k for k, m in enumerate(srt_mask) if m]
+            if len(idx) < rate:
+                return None
+            mean = sum(env) / len(env)
+            env = [x - mean for x in env]
+            best, best_score = 0, None
+            max_lag = int(2.5 * rate)
+            n = len(env)
+            for lag in range(-max_lag, max_lag + 1):
+                score = sum(env[k + lag] for k in idx if 0 <= k + lag < n)
+                if best_score is None or score > best_score:
+                    best, best_score = lag, score
+            return best / rate
+
+        length = min(window_sec, dur / 2) if dur else window_sec
+        start_lag = best_lag(0.0, length)
+        end_lag = best_lag(max(0.0, dur - length), length) if dur > length * 1.5 else None
+        if start_lag is None:
+            return ""
+        msg = f"Voice/subtitle check: voice is {start_lag * 1000:+.0f} ms from the subtitles at the start"
+        if end_lag is not None:
+            drift = end_lag - start_lag
+            msg += f", {end_lag * 1000:+.0f} ms at the end → drift {drift * 1000:+.0f} ms "
+            msg += "✅ voice stays with the subtitles" if abs(drift) <= 0.25 else "⚠️ the voice drifts from the subtitles (check the source episodes)"
+        return msg
 
     def extract_narto_subtitle_url(self, domain, narto_playlist, episode, html=""):
         sub_candidates = []
@@ -3810,12 +4101,15 @@ class DownloaderApp:
         chain = []
         cookie_file = os.path.join(self.base_dir, "shortmax_cookies.txt")
         if os.path.exists(cookie_file):
+            # 1. Try exported browser cookies first (bypasses Cloudflare challenge immediately)
             chain.append(["--cookies", cookie_file])
+        # 2. Try clean curl_cffi Chrome impersonation next
+        chain.append([])
+        # 3. Fall back to live browser cookie stores
         browsers = ["chrome", "edge", "firefox", "brave", "opera"]
         if sys.platform == "darwin":
             browsers.insert(0, "safari")
         chain += [["--cookies-from-browser", b] for b in browsers]
-        chain.append([])  # last resort: no cookies
         return chain
 
     def shortmax_impersonate_available(self, yt_dlp_path):
@@ -3859,11 +4153,1059 @@ class DownloaderApp:
             idx = getattr(self, "_sm_cookie_idx", 0)
             if idx < len(chain) - 1:
                 self._sm_cookie_idx = idx + 1
-                nxt = " ".join(chain[idx + 1]) or "no cookies"
+                nxt = " ".join(chain[idx + 1]) or "browser impersonation (no cookies)"
                 self.log_message(f"Shortmax: cookie source failed ({' '.join(chain[idx])}). Trying: {nxt}")
                 self.update_status(f"Shortmax: trying cookies from {nxt.replace('--cookies-from-browser ', '')}...", "orange")
                 return True
         return False
+
+
+    # =========================================================================
+    # 🎵 TIKTOK ENGINE (v1.9.0): no-cookie first, H.264 preferred, safe merging
+    # =========================================================================
+    TIKTOK_LOGIN_ERR = re.compile(r"(log ?in|cookies|private|age|unavailable for|requires? authentication|status code 10216)", re.IGNORECASE)
+
+    def tiktok_auth_chain(self):
+        """Public videos need no cookies; login cookies are only a fallback (Chrome's can't be read on Windows)."""
+        chain = [[]]
+        cookie_file = os.path.join(self.base_dir, "tiktok_cookies.txt")
+        if os.path.exists(cookie_file):
+            chain.append(["--cookies", cookie_file])
+        browsers = ["edge", "firefox", "chrome", "brave"]
+        if sys.platform == "darwin":
+            browsers.insert(0, "safari")
+        chain += [["--cookies-from-browser", b] for b in browsers]
+        return chain
+
+    def tiktok_format_args(self):
+        # H.264 + AAC plays everywhere (TikTok sometimes serves H.265 that Windows players can't open)
+        return ["-S", "vcodec:h264,res,acodec:aac", "--merge-output-format", "mp4", "--no-playlist"]
+
+    def download_tiktok_one(self, yt_dlp_path, url, file_name, accel_args, max_attempts=None):
+        """Downloads one TikTok, walking the login chain only when TikTok asks for it. Returns (ok, error)."""
+        chain = self.tiktok_auth_chain()
+        idx = min(getattr(self, "_tt_auth_idx", 0), len(chain) - 1)
+        attempts = max_attempts or (len(chain) + 1)
+        err = ""
+        for attempt in range(attempts):
+            if self.stop_flag:
+                return False, "User stopped process."
+            cmd = [yt_dlp_path, *chain[idx], *self.tiktok_format_args(), *accel_args, "-o", file_name, url]
+            succ, err = self.run_yt_dlp_with_progress(cmd)
+            if succ and self.is_valid_video_file(file_name):
+                self._tt_auth_idx = idx
+                return True, ""
+            if os.path.exists(file_name):
+                try: os.remove(file_name)
+                except: pass
+            needs_login = bool(self.TIKTOK_LOGIN_ERR.search(err or "")) or bool(self.SHORTMAX_COOKIE_ERR.search(err or ""))
+            if needs_login and idx < len(chain) - 1:
+                idx += 1
+                self.log_message(f"TikTok: trying login source {' '.join(chain[idx])}")
+                continue
+            time.sleep(1.5)
+        return False, err
+
+    def probe_media(self, path):
+        """Video/audio facts for merging (ffprobe, or ffmpeg's banner as a fallback)."""
+        info = {"video": False, "audio": False, "vcodec": "", "w": 0, "h": 0, "fps": 0.0, "acodec": "", "sr": 0, "ch": 0}
+        ffprobe = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        if ffprobe:
+            try:
+                res = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-of", "json", path], capture_output=True,
+                                     text=True, encoding="utf-8", errors="ignore", **kwargs)
+                for st in json.loads(res.stdout or "{}").get("streams", []):
+                    if st.get("codec_type") == "video" and not info["video"] and st.get("disposition", {}).get("attached_pic", 0) == 0:
+                        num, _, den = (st.get("avg_frame_rate") or "0/1").partition("/")
+                        info.update(video=True, vcodec=st.get("codec_name", ""), w=int(st.get("width", 0)), h=int(st.get("height", 0)),
+                                    fps=round(float(num) / float(den or 1), 2) if float(den or 1) else 0.0)
+                    elif st.get("codec_type") == "audio" and not info["audio"]:
+                        info.update(audio=True, acodec=st.get("codec_name", ""), sr=int(st.get("sample_rate", 0) or 0), ch=int(st.get("channels", 0) or 0))
+                return info
+            except Exception:
+                pass
+        res = self.run_ffmpeg(["ffmpeg", "-hide_banner", "-i", path])
+        txt = res.stderr or ""
+        mv = re.search(r"Video: (\w+).*?(\d{2,5})x(\d{2,5})", txt)
+        if mv:
+            fps = re.search(r"(\d+(?:\.\d+)?) fps", txt)
+            info.update(video=True, vcodec=mv.group(1), w=int(mv.group(2)), h=int(mv.group(3)), fps=float(fps.group(1)) if fps else 0.0)
+        ma = re.search(r"Audio: (\w+), (\d+) Hz, (\w+)", txt)
+        if ma:
+            info.update(audio=True, acodec=ma.group(1), sr=int(ma.group(2)), ch=2 if "stereo" in ma.group(3) else 1)
+        return info
+
+    def merge_clips_uniform(self, files, final_output, status_prefix="Merging"):
+        """
+        Joins clips that may differ in size, codec, frame rate or audio (typical for TikTok).
+        Matching clips are joined instantly; otherwise each is converted to one uniform format first.
+        Returns (ok, message).
+        """
+        infos = [(f, self.probe_media(f)) for f in files]
+        usable = [(f, i) for f, i in infos if i["video"]]
+        skipped = [os.path.basename(f) for f, i in infos if not i["video"]]
+        if skipped:
+            self.log_message(f"Merge: skipped {len(skipped)} file(s) without video (photo/audio posts): {', '.join(skipped)}")
+        if not usable:
+            return False, "None of the downloads contain video."
+        first = usable[0][1]
+        same = all(i["vcodec"] == "h264" and (i["w"], i["h"]) == (first["w"], first["h"]) and abs(i["fps"] - first["fps"]) < 0.05
+                   and i["audio"] and i["acodec"] == "aac" and i["sr"] == first["sr"] and i["ch"] == first["ch"] for _, i in usable)
+        work_files = [f for f, _ in usable]
+        tmp_files = []
+        if not same:
+            portrait = sum(1 for _, i in usable if i["h"] >= i["w"]) >= len(usable) / 2
+            W, H = (1080, 1920) if portrait else (1920, 1080)
+            vf = (f"[0:v]split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=20:2[bg];"
+                  f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p,setsar=1[v]")
+            work_files = []
+            for k, (f, info) in enumerate(usable, 1):
+                if self.stop_flag:
+                    return False, "Stopped."
+                self.update_status(f"{status_prefix}: making clip {k}/{len(usable)} uniform ({W}×{H})...", "#f59e0b")
+                out = f + ".uniform.mp4"
+                cmd = ["ffmpeg", "-y", "-i", f]
+                if not info["audio"]:
+                    cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+                cmd += ["-filter_complex", vf, "-map", "[v]", "-map", "0:a:0" if info["audio"] else "1:a:0",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "160k", "-shortest", "-movflags", "+faststart", out]
+                res = self.run_ffmpeg(cmd)
+                if res.returncode != 0 or not os.path.exists(out):
+                    self.log_message(f"Merge: could not convert {os.path.basename(f)}:\n{(res.stderr or '')[-800:]}")
+                    continue
+                work_files.append(out)
+                tmp_files.append(out)
+            if not work_files:
+                return False, "Could not convert any clip for merging."
+        self.update_status(f"{status_prefix}: joining {len(work_files)} clips...", "#f59e0b")
+        res = self.concat_video_files_synced(work_files, final_output, normalize_first=False, status_prefix=status_prefix)
+        for t in tmp_files:
+            try: os.remove(t)
+            except: pass
+        if res.returncode != 0 or not os.path.exists(final_output):
+            return False, (res.stderr or "")[-800:]
+        self.record_last_output(final_output)
+        return True, f"Merged {len(work_files)} clip(s)" + (" (converted to a uniform format)" if not same else "") + \
+            (f", skipped {len(skipped)} without video" if skipped else "")
+
+
+    # =========================================================================
+    # ⚙️ v1.9.0 — SETTINGS (SAVED), THEMES, NOTIFICATIONS, QUEUE, LIBRARY, HEALTH
+    # =========================================================================
+    SETTINGS_DEFAULTS = {
+        "theme": "auto", "max_quality": "best", "speed_limit": "", "notify": True,
+        "queue_end_action": "notify", "schedule_on": False, "schedule_from": "01:00", "schedule_to": "07:00",
+        "turbo": True, "sync_lock": True, "auto_sub": True, "narto_workers": 3, "output_dir": "",
+        "fme_monitor": "Small",
+    }
+
+    def load_settings(self):
+        self.settings_path = os.path.join(self.base_dir, "downloader_settings.json")
+        self.settings = dict(self.SETTINGS_DEFAULTS)
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.settings.update({k: v for k, v in saved.items() if k in self.SETTINGS_DEFAULTS})
+        except Exception:
+            pass
+
+    def save_settings(self):
+        try:
+            for key, var in (("turbo", getattr(self, "turbo_var", None)), ("sync_lock", getattr(self, "sync_lock_var", None)),
+                             ("auto_sub", getattr(self, "auto_sub_var", None))):
+                if var is not None:
+                    self.settings[key] = bool(var.get())
+            if hasattr(self, "narto_claude_parallel_var"):
+                self.settings["narto_workers"] = int(self.narto_claude_parallel_var.get())
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception:
+            pass
+
+    def apply_saved_settings(self):
+        """Puts saved choices back into the dashboard after it is built."""
+        self.turbo_var.set(self.settings["turbo"])
+        self.sync_lock_var.set(self.settings["sync_lock"])
+        self.auto_sub_var.set(self.settings["auto_sub"])
+        try:
+            self.narto_claude_parallel_var.set(int(self.settings["narto_workers"]))
+        except Exception:
+            pass
+        out_dir = self.settings.get("output_dir")
+        if out_dir and os.path.isdir(out_dir):
+            self.output_base = out_dir
+            self.last_output_folder = out_dir
+        for var in (self.turbo_var, self.sync_lock_var, self.auto_sub_var, self.narto_claude_parallel_var):
+            var.trace_add("write", lambda *_: self.save_settings())
+
+    # ---------------------------------------------------------------- themes
+    THEME_BG_MAP = {
+        "#0b0f19": "#eef2f7", "#131b2e": "#ffffff", "#111a2c": "#f6f8fb", "#1e293b": "#e2e8f0", "#0f172a": "#dbe3ee",
+        "#090d16": "#e2e8f0", "#1f2937": "#dfe6ef", "#334155": "#c3cddb", "#2e384d": "#c3cddb", "#0e1422": "#f3f6fa",
+    }
+    THEME_FG_MAP = {
+        "#f8fafc": "#0f172a", "#f1f5f9": "#0f172a", "#ffffff": "#0f172a", "#e2e8f0": "#1e293b", "#cbd5e1": "#334155",
+        "#94a3b8": "#526075", "#64748b": "#526075", "#38bdf8": "#0369a1", "#10b981": "#047857", "#f59e0b": "#b45309",
+        "#fbbf24": "#b45309", "#a855f7": "#7e22ce", "#f43f5e": "#be123c", "#475569": "#64748b",
+    }
+    KEEP_DARK = {"#111827", "#070a12", "#0d1322", "#000000"}     # header bar, monitors and editing timelines
+
+    @staticmethod
+    def os_prefers_dark() -> bool:
+        try:
+            if sys.platform == "win32":
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+            if sys.platform == "darwin":
+                r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True, timeout=5)
+                return "dark" in r.stdout.lower()
+            r = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                return "dark" in r.stdout.lower()
+        except Exception:
+            pass
+        return True
+
+    def resolved_theme(self) -> str:
+        choice = self.settings.get("theme", "auto")
+        return ("dark" if self.os_prefers_dark() else "light") if choice == "auto" else choice
+
+    def theme_fg(self, color: str) -> str:
+        if getattr(self, "_theme_now", "dark") == "light":
+            return self.THEME_FG_MAP.get(str(color).lower(), color)
+        return color
+
+    def set_theme_choice(self, choice: str):
+        self.settings["theme"] = choice
+        self.save_settings()
+        self.apply_ui_theme(force=True)
+        if hasattr(self, "theme_pill"):
+            self.theme_pill.config(text={"auto": "🌓 Auto", "dark": "🌙 Dark", "light": "☀️ Light"}[choice])
+        if hasattr(self, "theme_choice_var"):
+            self.theme_choice_var.set(choice)
+
+    def cycle_theme(self):
+        order = ["auto", "dark", "light"]
+        self.set_theme_choice(order[(order.index(self.settings.get("theme", "auto")) + 1) % 3])
+
+    def _watch_os_theme(self):
+        if self.settings.get("theme") == "auto":
+            self.apply_ui_theme()
+        self.root.after(20000, self._watch_os_theme)
+
+    def apply_ui_theme(self, force=False):
+        name = self.resolved_theme()
+        if not force and name == getattr(self, "_theme_now", "dark"):
+            return
+        self._theme_now = name
+        light = name == "light"
+        style = ttk.Style(self.root)
+        P = {"bg": "#eef2f7" if light else "#0b0f19", "card": "#ffffff" if light else "#131b2e",
+             "panel": "#f6f8fb" if light else "#111a2c", "field": "#ffffff" if light else "#1e293b",
+             "text": "#0f172a" if light else "#f1f5f9", "muted": "#526075" if light else "#94a3b8",
+             "accent": "#0369a1" if light else "#38bdf8", "border": "#cdd6e3" if light else "#24324d",
+             "hi": "#ffffff" if light else "#2c3b5b", "lo": "#aeb9cb" if light else "#04060b", "btnbg": "#f3f6fa" if light else "#0e1422"}
+        style.configure(".", background=P["bg"], foreground=P["text"])
+        style.configure("TFrame", background=P["bg"])
+        style.configure("Card.TFrame", background=P["card"])
+        style.configure("TLabel", background=P["bg"], foreground=P["text"])
+        style.configure("TCheckbutton", background=P["bg"], foreground=P["text"])
+        style.map("TCheckbutton", background=[("active", P["bg"])])
+        style.configure("TRadiobutton", background=P["card"], foreground=P["text"])
+        style.map("TRadiobutton", background=[("active", P["card"])])
+        style.configure("TButton", foreground=P["text"])
+        style.configure("TEntry", fieldbackground=P["field"], foreground=P["text"], insertcolor=P["text"])
+        style.configure("TCombobox", fieldbackground=P["field"], background=P["field"], foreground=P["text"])
+        style.map("TCombobox", fieldbackground=[("readonly", P["field"])], foreground=[("readonly", P["text"])])
+        style.configure("TSpinbox", fieldbackground=P["field"], foreground=P["text"], background=P["field"])
+        style.map("TSpinbox", fieldbackground=[("readonly", P["field"])], foreground=[("readonly", P["text"])])
+        style.configure("TLabelframe", background=P["card"], bordercolor=P["border"], lightcolor=P["hi"], darkcolor=P["lo"])
+        style.configure("TLabelframe.Label", background=P["card"], foreground=P["accent"])
+        style.configure("Panel.TFrame", background=P["panel"])
+        style.configure("Panel.TLabel", background=P["panel"], foreground=P["text"])
+        style.configure("Muted.Panel.TLabel", background=P["panel"], foreground=P["muted"])
+        style.configure("Title.Panel.TLabel", background=P["panel"], foreground=P["text"])
+        style.configure("Panel.TLabelframe", background=P["panel"], bordercolor=P["border"], lightcolor=P["hi"], darkcolor=P["lo"])
+        style.configure("Panel.TLabelframe.Label", background=P["panel"], foreground=P["accent"])
+        for st, bgk in (("Card.TCheckbutton", "card"), ("Card.TRadiobutton", "card"), ("Panel.TCheckbutton", "panel"), ("Panel.TRadiobutton", "panel")):
+            style.configure(st, background=P[bgk], foreground=P["text"])
+            style.map(st, background=[("active", P[bgk])])
+        style.configure("TNotebook", background=P["bg"], bordercolor=P["border"], lightcolor=P["hi"], darkcolor=P["lo"])
+        style.configure("TNotebook.Tab", foreground="#334155" if light else "#94a3b8", background=P["bg"])
+        style.map("TNotebook.Tab", foreground=[("selected", "#ffffff"), ("active", "#0f172a" if light else "#e2e8f0")])
+        style.configure("Treeview", background=P["field"], fieldbackground=P["field"], foreground=P["text"], rowheight=24,
+                        bordercolor=P["border"])
+        style.map("Treeview", background=[("selected", "#2563eb")], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=P["card"], foreground=P["text"], font=("Arial", 9, "bold"))
+        self._retint_3d_images(light, P)
+        self.root.configure(bg=P["bg"])
+        self._remap_tree(self.root, light)
+        if hasattr(self, "status_label"):
+            self.status_label.config(fg=self.theme_fg(self.status_label.cget("fg")) if light else self.status_label.cget("fg"))
+
+    def _copy_into(self, img, new):
+        img.blank()
+        img.tk.call(img, "copy", new)
+
+    def _retint_3d_images(self, light, P):
+        imgs = getattr(self, "_img3d", None)
+        if not imgs:
+            return
+        R, BG = self.root, P["btnbg"]
+        plain = (("#ffffff", "#dfe6ef", "#b9c4d4", "#ffffff", "#d4e2fb", "#cfd8e5", "#eef2f7") if light else
+                 ("#334155", "#1e293b", "#475569", "#3f5270", "#26344d", "#1e293b", "#334155"))
+        dis = ("#eef1f5", "#e3e8ef", "#d7dee8") if light else ("#141b2b", "#101624", "#1e293b")
+        sets = {"plain": plain, "accent": ("#3b82f6", "#1d4ed8", "#60a5fa", "#60a5fa", "#2563eb", "#1d4ed8", "#3b82f6"),
+                "danger": ("#f43f5e", "#be123c", "#fb7185", "#fb7185", "#e11d48", "#be123c", "#f43f5e"),
+                "success": ("#10b981", "#047857", "#34d399", "#34d399", "#059669", "#047857", "#10b981")}
+        for key, (top, bot, edge, ht, hb, pt, pb) in sets.items():
+            d = imgs.get(key)
+            if not d:
+                continue
+            self._copy_into(d["n"], render_glossy(R, 22, 24, top, bot, edge, BG, radius=6))
+            self._copy_into(d["a"], render_glossy(R, 22, 24, ht, hb, edge, BG, radius=6))
+            self._copy_into(d["p"], render_glossy(R, 22, 24, pt, pb, edge, BG, radius=6, pressed=True))
+            self._copy_into(d["d"], render_glossy(R, 22, 24, dis[0], dis[1], dis[2], BG, radius=6, flat=True))
+        if "tabs" in imgs:
+            tn, ta, ts = imgs["tabs"]
+            tab_bg = P["bg"]
+            self._copy_into(tn, render_glossy(R, 24, 30, *(("#ffffff", "#e4eaf2", "#c9d3e1") if light else ("#1e293b", "#111827", "#334155")), tab_bg, radius=9))
+            self._copy_into(ta, render_glossy(R, 24, 30, *(("#ffffff", "#dbe6f5", "#93c5fd") if light else ("#2b3a55", "#172033", "#475569")), tab_bg, radius=9))
+            self._copy_into(ts, render_glossy(R, 24, 30, "#3b82f6", "#1e40af", "#93c5fd", tab_bg, radius=9))
+        if "progress" in imgs:
+            tr, _pb = imgs["progress"]
+            self._copy_into(tr, render_glossy(R, 24, 18, *(("#d5dde8", "#eef2f7", "#c3cddb") if light else ("#05070d", "#111827", "#1e293b")),
+                                              P["card"] if light else "#0e1422", radius=8, pressed=True, shadow=0))
+        off = ("#ffffff", "#e6ebf2", "#94a3b8") if light else ("#1e293b", "#0f172a", "#475569")
+        for suffix, bg in (("", P["bg"]), ("Card.", P["card"]), ("Panel.", P["panel"])):
+            group = imgs.get(f"check{suffix}")
+            if not group:
+                continue
+            news = (render_check(R, 16, False, "#3b82f6", bg, off=off), render_check(R, 16, True, "#3b82f6", bg),
+                    render_check(R, 16, False, "#3b82f6", bg, True, off=off), render_check(R, 16, True, "#3b82f6", bg, True))
+            for old, new in zip(group, news):
+                self._copy_into(old, new)
+
+    def _remap_tree(self, widget, light):
+        self._remap_widget(widget, light)
+        for child in widget.winfo_children():
+            self._remap_tree(child, light)
+
+    def _remap_widget(self, w, light):
+        if w is self.root:
+            return
+        orig = getattr(w, "_ank_orig", None)
+        if orig is None:
+            orig = {}
+            for opt in ("bg", "background", "fg", "foreground", "activebackground", "highlightbackground", "selectcolor",
+                        "troughcolor", "insertbackground", "disabledforeground"):
+                try:
+                    val = w.cget(opt)
+                except Exception:
+                    continue
+                val = str(val)
+                if val.startswith("#") and len(val) == 7:
+                    orig[opt] = val.lower()
+            try:
+                w._ank_orig = orig
+            except Exception:
+                return
+        if getattr(w, "_ank_badge", None):
+            glyph_color, size = w._ank_badge
+            bg = "#f6f8fb" if light else "#111a2c"
+            top = _hexc(_mix(_rgb(glyph_color), (255, 255, 255), 0.18))
+            bot = _hexc(_mix(_rgb(glyph_color), (0, 0, 0), 0.45))
+            edge = _hexc(_mix(_rgb(glyph_color), (255, 255, 255), 0.45))
+            self._copy_into(w._img3d, render_glossy(self.root, size, size + 3, top, bot, edge, bg, radius=12, shadow=3))
+        bg_now = orig.get("bg") or orig.get("background")
+        new_bg = self.THEME_BG_MAP.get(bg_now, bg_now) if (light and bg_now) else bg_now
+        bg_is_light = bool(new_bg) and new_bg not in self.KEEP_DARK and sum(_rgb(new_bg)) > 500
+        for opt, val in orig.items():
+            target = val
+            if light:
+                if opt in ("bg", "background", "activebackground", "highlightbackground", "selectcolor", "troughcolor"):
+                    target = self.THEME_BG_MAP.get(val, val) if val not in self.KEEP_DARK else val
+                elif opt in ("fg", "foreground", "insertbackground", "disabledforeground") and bg_is_light:
+                    target = self.THEME_FG_MAP.get(val, val)
+            try:
+                w.configure(**{opt: target})
+            except Exception:
+                pass
+
+    # --------------------------------------------------------- notifications
+    def notify(self, title: str, message: str):
+        """Desktop notification (Windows balloon / macOS / Linux) plus a gentle bell."""
+        try:
+            self.root.bell()
+        except Exception:
+            pass
+        if not self.settings.get("notify", True):
+            return
+        try:
+            if sys.platform == "win32":
+                t = title.replace("'", "''")
+                m = message.replace("'", "''")
+                ps = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+                      "$n=New-Object System.Windows.Forms.NotifyIcon; $n.Icon=[System.Drawing.SystemIcons]::Information; "
+                      f"$n.Visible=$true; $n.ShowBalloonTip(8000,'{t}','{m}',[System.Windows.Forms.ToolTipIcon]::Info); "
+                      "Start-Sleep -s 9; $n.Dispose()")
+                subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], creationflags=0x08000000)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e", f'display notification "{message}" with title "{title}"'])
+            elif shutil.which("notify-send"):
+                subprocess.Popen(["notify-send", title, message])
+        except Exception:
+            pass
+
+    # ---------------------------------------- global speed limit & quality
+    def with_global_args(self, cmd):
+        """Adds the Settings speed limit and maximum quality to any yt-dlp command."""
+        cmd = list(cmd)
+        extra = []
+        lim = str(self.settings.get("speed_limit") or "").strip()
+        if lim:
+            extra += ["--limit-rate", lim]
+        q = self.settings.get("max_quality", "best")
+        if q != "best":
+            sort = "+size,+br,+res" if q == "smallest" else f"res:{q}"
+            if "-S" in cmd:
+                i = cmd.index("-S") + 1
+                parts = cmd[i].split(",")
+                cmd[i] = ",".join([sort if p == "res" else p for p in parts]) if "res" in parts else ",".join(parts + [sort])
+            else:
+                extra += ["-S", sort]
+        return [cmd[0]] + extra + cmd[1:] if extra else cmd
+
+    # --------------------------------------------------------- library
+    VIDEO_FILE_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts")
+
+    def scan_library(self):
+        series = {}
+        base = self.output_base
+        for root_dir, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d != "_resume" and not d.startswith("temp")]
+            for fn in files:
+                if not fn.lower().endswith(self.VIDEO_FILE_EXTS) or fn.endswith((".part", ".synclock.mp4", ".uniform.mp4")):
+                    continue
+                fp = os.path.join(root_dir, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                if st.st_size < 200 * 1024:
+                    continue
+                rel = os.path.relpath(fp, base).split(os.sep)
+                name = rel[1] if len(rel) >= 3 else (rel[0] if len(rel) >= 2 else os.path.splitext(fn)[0])
+                entry = series.setdefault(name, {"name": name, "files": [], "size": 0, "mtime": 0})
+                entry["files"].append(fp)
+                entry["size"] += st.st_size
+                entry["mtime"] = max(entry["mtime"], st.st_mtime)
+        return sorted(series.values(), key=lambda e: -e["mtime"])
+
+    @staticmethod
+    def _norm_key(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+    def series_key_from_url(self, url: str) -> str:
+        try:
+            p = urllib.parse.urlparse(url)
+        except Exception:
+            return ""
+        q = urllib.parse.parse_qs(p.query)
+        if "shortmax" in p.netloc:
+            return (q.get("slug") or q.get("id") or [""])[0]
+        if "narto" in p.netloc:
+            parts = [x for x in p.path.split("/") if x and not x.isdigit()]
+            return parts[-1] if parts else ""
+        m = re.search(r"video/(\d+)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"dailymotion\.com/video/(\w+)", url)
+        return m.group(1) if m else ""
+
+    def confirm_not_duplicate(self, url: str) -> bool:
+        key = self._norm_key(self.series_key_from_url(url))
+        if len(key) < 3:
+            return True
+        for e in self.scan_library():
+            if key in self._norm_key(e["name"]) or any(key in self._norm_key(os.path.basename(f)) for f in e["files"]):
+                when = datetime.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
+                return messagebox.askyesno("Already downloaded",
+                                           f"'{e['name']}' is already in your library ({len(e['files'])} file(s), last on {when}).\n\nDownload it again?")
+        return True
+
+    # --------------------------------------------------------- health / updates
+    def ytdlp_update_command(self):
+        path = self.get_yt_dlp_path()
+        if path and os.path.exists(path):
+            folder = os.path.dirname(path)
+            for py in (os.path.join(folder, "python.exe"), os.path.join(folder, "python"), os.path.join(folder, "python3"),
+                       os.path.join(os.path.dirname(folder), "python.exe")):
+                if os.path.isfile(py):
+                    return [py, "-m", "pip", "install", "-U", "yt-dlp[default,curl-cffi]"]
+            return [path, "-U"]
+        return [sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default,curl-cffi]"]
+
+    def engine_versions(self):
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+
+        def first_line(cmd):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=30, **kwargs)
+                out = (r.stdout or r.stderr or "").strip().splitlines()
+                return out[0][:80] if out and r.returncode == 0 else "not working"
+            except Exception:
+                return "not found"
+        yt = self.get_yt_dlp_path()
+        rows = [("yt-dlp", first_line([yt, "--version"]) if yt and os.path.exists(yt) else "not found")]
+        imp = "not found"
+        if yt and os.path.exists(yt):
+            try:
+                r = subprocess.run([yt, "--list-impersonate-targets"], capture_output=True, text=True, encoding="utf-8",
+                                   errors="ignore", timeout=40, **kwargs)
+                imp = "ready (Chrome impersonation available)" if any(ln.strip().lower().startswith("chrome") and "unavailable" not in ln.lower()
+                                                                     for ln in r.stdout.splitlines()) else "missing — click Update yt-dlp"
+            except Exception:
+                imp = "unknown"
+        rows.append(("curl_cffi (impersonation)", imp))
+        rows.append(("FFmpeg", first_line(["ffmpeg", "-version"]) if shutil.which("ffmpeg") else "not found"))
+        aria = self.get_aria2c_path()
+        rows.append(("aria2c", first_line([aria, "--version"]) if aria else "not found (optional)"))
+        rows.append(("curl", first_line(["curl", "--version"]) if shutil.which("curl") else "not found"))
+        rows.append(("Python", sys.version.split()[0]))
+        return rows
+
+    # --------------------------------------------------------- pages
+    def build_extra_pages(self):
+        self.build_dl_queue_page()
+        self.build_library_page()
+        self.build_settings_page()
+
+    def _page_header(self, page, text, sub):
+        hdr = ttk.Frame(page)
+        hdr.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(hdr, text=text, font=("Arial", 15, "bold"), bg="#0b0f19", fg="#f8fafc").pack(anchor="w")
+        tk.Label(hdr, text=sub, font=("Arial", 9), bg="#0b0f19", fg="#94a3b8").pack(anchor="w")
+
+    # ---- Queue page ----
+    QUEUE_TYPES = [("narto_claude", "Narto ⚡ Claude (turbo)"), ("narto", "Narto (Original)"), ("shortmax", "Shortmax"),
+                   ("tiktok", "TikTok (single)"), ("tiktok_bulk", "TikTok bulk (.txt file)"), ("dailymotion", "Dailymotion"),
+                   ("direct", "Direct M3U8 / MP4"), ("torrent", "Torrent / Magnet")]
+
+    def build_dl_queue_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["dlqueue"] = page
+        self._page_header(page, "📋 Download Queue", "Add as many series as you like — they download one after another, "
+                                                     "survive restarts, and resume where they stopped.")
+        add = ttk.LabelFrame(page, text="➕ Add a download", padding=(12, 6))
+        add.pack(fill="x", padx=14, pady=4)
+        row1 = ttk.Frame(add, style="Card.TFrame")
+        row1.pack(fill="x", pady=2)
+        self.q_type_var = tk.StringVar(value=self.QUEUE_TYPES[0][1])
+        ttk.Combobox(row1, textvariable=self.q_type_var, values=[t for _, t in self.QUEUE_TYPES], state="readonly", width=24).pack(side="left", padx=(0, 6))
+        self.q_url_entry = ttk.Entry(row1, width=60)
+        self.q_url_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(row1, text="📋 Paste", command=lambda: (self.q_url_entry.delete(0, tk.END),
+                                                         self.q_url_entry.insert(0, self.root.clipboard_get().strip()))).pack(side="left", padx=4)
+        ttk.Button(row1, text="📄 File…", command=self._queue_pick_file).pack(side="left")
+        row2 = ttk.Frame(add, style="Card.TFrame")
+        row2.pack(fill="x", pady=4)
+        ttk.Label(row2, text="Start Ep:", background="#131b2e").pack(side="left")
+        self.q_start = ttk.Entry(row2, width=6)
+        self.q_start.insert(0, "1")
+        self.q_start.pack(side="left", padx=(4, 12))
+        ttk.Label(row2, text="Total Eps (blank = all):", background="#131b2e").pack(side="left")
+        self.q_total = ttk.Entry(row2, width=6)
+        self.q_total.pack(side="left", padx=(4, 12))
+        ttk.Button(row2, text="➕ Add to Queue", style="Accent.TButton", command=self._queue_add_from_form).pack(side="left", padx=6)
+        ttk.Button(row2, text="➕ Add Current Dashboard Link", command=self.queue_add_current_dashboard).pack(side="left")
+
+        lst = ttk.LabelFrame(page, text="Queue", padding=(10, 6))
+        lst.pack(fill="both", expand=True, padx=14, pady=4)
+        cols = ("type", "link", "eps", "status")
+        self.q_tree = ttk.Treeview(lst, columns=cols, show="headings", height=10)
+        for c, w_, title in (("type", 170, "Type"), ("link", 520, "Link / file"), ("eps", 90, "Episodes"), ("status", 200, "Status")):
+            self.q_tree.heading(c, text=title)
+            self.q_tree.column(c, width=w_, anchor="w")
+        self.q_tree.pack(fill="both", expand=True)
+        btns = ttk.Frame(lst, style="Card.TFrame")
+        btns.pack(fill="x", pady=(6, 0))
+        self.q_start_btn = ttk.Button(btns, text="▶️ Start Queue", style="Success.TButton", command=self.start_dl_queue)
+        self.q_start_btn.pack(side="left", padx=2)
+        ttk.Button(btns, text="⏸️ Pause After Current", command=self._queue_pause).pack(side="left", padx=2)
+        ttk.Button(btns, text="⬆️", width=3, command=lambda: self._queue_move(-1)).pack(side="left", padx=2)
+        ttk.Button(btns, text="⬇️", width=3, command=lambda: self._queue_move(1)).pack(side="left", padx=2)
+        ttk.Button(btns, text="🔁 Retry", command=self._queue_retry).pack(side="left", padx=2)
+        ttk.Button(btns, text="🗑️ Remove", command=self._queue_remove).pack(side="left", padx=2)
+        ttk.Button(btns, text="🧹 Clear Finished", command=self._queue_clear_done).pack(side="left", padx=2)
+
+        opts = ttk.LabelFrame(page, text="⏰ Schedule & when finished", padding=(12, 6))
+        opts.pack(fill="x", padx=14, pady=(4, 10))
+        r = ttk.Frame(opts, style="Card.TFrame")
+        r.pack(fill="x")
+        self.q_sched_var = tk.BooleanVar(value=bool(self.settings.get("schedule_on")))
+        ttk.Checkbutton(r, text="Only download between", variable=self.q_sched_var, style="Card.TCheckbutton",
+                        command=self._queue_save_options).pack(side="left")
+        self.q_from = ttk.Entry(r, width=6)
+        self.q_from.insert(0, self.settings.get("schedule_from", "01:00"))
+        self.q_from.pack(side="left", padx=4)
+        ttk.Label(r, text="and", background="#131b2e").pack(side="left")
+        self.q_to = ttk.Entry(r, width=6)
+        self.q_to.insert(0, self.settings.get("schedule_to", "07:00"))
+        self.q_to.pack(side="left", padx=4)
+        ttk.Label(r, text="   When the queue finishes:", background="#131b2e").pack(side="left", padx=(10, 4))
+        self.q_end_var = tk.StringVar(value={"none": "Do nothing", "notify": "Notify me", "shutdown": "Shut down the PC"}[self.settings.get("queue_end_action", "notify")])
+        cb = ttk.Combobox(r, textvariable=self.q_end_var, values=["Do nothing", "Notify me", "Shut down the PC"], state="readonly", width=18)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._queue_save_options())
+        for e_ in (self.q_from, self.q_to):
+            e_.bind("<FocusOut>", lambda e: self._queue_save_options())
+        self.queue_path = os.path.join(self.base_dir, "download_queue.json")
+        self.dl_queue = []
+        self._queue_running = False
+        self._queue_pause_req = False
+        self._load_queue()
+
+    def _queue_pick_file(self):
+        f = filedialog.askopenfilename(title="Choose a TikTok link list or .torrent", filetypes=[("Lists / torrents", "*.txt *.rtf *.torrent"), ("All files", "*.*")])
+        if f:
+            self.q_url_entry.delete(0, tk.END)
+            self.q_url_entry.insert(0, f)
+            if f.lower().endswith(".torrent"):
+                self.q_type_var.set("Torrent / Magnet")
+            elif f.lower().endswith((".txt", ".rtf")):
+                self.q_type_var.set("TikTok bulk (.txt file)")
+
+    def _queue_type_key(self, title):
+        return next((k for k, t in self.QUEUE_TYPES if t == title), "direct")
+
+    def _load_queue(self):
+        try:
+            with open(self.queue_path, "r", encoding="utf-8") as f:
+                self.dl_queue = json.load(f)
+        except Exception:
+            self.dl_queue = []
+        for j in self.dl_queue:
+            if j.get("status") in ("Running", "Waiting for schedule"):
+                j["status"] = "Pending (will resume)"
+        self._refresh_queue_view()
+
+    def _save_queue(self):
+        try:
+            with open(self.queue_path, "w", encoding="utf-8") as f:
+                json.dump(self.dl_queue, f, indent=2)
+        except Exception:
+            pass
+
+    def _refresh_queue_view(self):
+        if not hasattr(self, "q_tree"):
+            return
+        sel = self.q_tree.selection()
+        self.q_tree.delete(*self.q_tree.get_children())
+        titles = dict(self.QUEUE_TYPES)
+        for i, j in enumerate(self.dl_queue):
+            eps = f"{j.get('start', 1)}–{j.get('total') or 'all'}" if j["type"] not in ("tiktok", "dailymotion", "direct", "torrent") else "—"
+            self.q_tree.insert("", "end", iid=str(i), values=(titles.get(j["type"], j["type"]), j["url"], eps, j.get("status", "Pending")))
+        for s in sel:
+            if self.q_tree.exists(s):
+                self.q_tree.selection_add(s)
+
+    def queue_add(self, jtype, url, start=1, total="", check_duplicate=True):
+        url = (url or "").strip()
+        if not url:
+            messagebox.showerror("Queue", "Paste a link (or choose a file) first.")
+            return False
+        if jtype not in ("tiktok_bulk", "torrent") and check_duplicate and not self.confirm_not_duplicate(url):
+            return False
+        self.dl_queue.append({"type": jtype, "url": url, "start": int(start) if str(start).isdigit() else 1,
+                              "total": str(total).strip(), "status": "Pending", "added": time.time()})
+        self._save_queue()
+        self._refresh_queue_view()
+        self.update_status(f"Added to queue ({len(self.dl_queue)} item(s)). Open 📋 Queue to start.", "green")
+        return True
+
+    def _queue_add_from_form(self):
+        if self.queue_add(self._queue_type_key(self.q_type_var.get()), self.q_url_entry.get(), self.q_start.get(), self.q_total.get()):
+            self.q_url_entry.delete(0, tk.END)
+
+    def queue_add_current_dashboard(self):
+        """Queues whatever link is in the dashboard tab that is open, with the current Start/Total episodes."""
+        tab = self.home_tabs.index("current")
+        mapping = {0: ("shortmax", self.url_entry1), 1: ("narto", self.url_entry2), 2: ("narto_claude", self.url_entry7),
+                   3: ("dailymotion", self.url_entry5), 4: ("tiktok", self.url_entry4), 5: ("direct", self.url_entry3),
+                   6: ("torrent", self.url_entry6)}
+        jtype, entry = mapping.get(tab, ("direct", self.url_entry3))
+        self.queue_add(jtype, entry.get(), self.start_entry.get(), self.total_entry.get())
+
+    def _queue_selected_index(self):
+        sel = self.q_tree.selection()
+        return int(sel[0]) if sel else -1
+
+    def _queue_move(self, d):
+        i = self._queue_selected_index()
+        j = i + d
+        if 0 <= i < len(self.dl_queue) and 0 <= j < len(self.dl_queue):
+            self.dl_queue[i], self.dl_queue[j] = self.dl_queue[j], self.dl_queue[i]
+            self._save_queue()
+            self._refresh_queue_view()
+            self.q_tree.selection_set(str(j))
+
+    def _queue_remove(self):
+        i = self._queue_selected_index()
+        if 0 <= i < len(self.dl_queue) and self.dl_queue[i].get("status") != "Running":
+            self.dl_queue.pop(i)
+            self._save_queue()
+            self._refresh_queue_view()
+
+    def _queue_retry(self):
+        i = self._queue_selected_index()
+        if 0 <= i < len(self.dl_queue) and self.dl_queue[i].get("status") != "Running":
+            self.dl_queue[i]["status"] = "Pending"
+            self._save_queue()
+            self._refresh_queue_view()
+
+    def _queue_clear_done(self):
+        self.dl_queue = [j for j in self.dl_queue if not j.get("status", "").startswith("Done")]
+        self._save_queue()
+        self._refresh_queue_view()
+
+    def _queue_pause(self):
+        self._queue_pause_req = True
+        self.update_status("Queue will pause after the current download.", "orange")
+
+    def _queue_save_options(self):
+        self.settings["schedule_on"] = bool(self.q_sched_var.get())
+        self.settings["schedule_from"] = self.q_from.get().strip() or "01:00"
+        self.settings["schedule_to"] = self.q_to.get().strip() or "07:00"
+        self.settings["queue_end_action"] = {"Do nothing": "none", "Notify me": "notify", "Shut down the PC": "shutdown"}[self.q_end_var.get()]
+        self.save_settings()
+
+    def _in_schedule(self) -> bool:
+        if not self.settings.get("schedule_on"):
+            return True
+        try:
+            now = datetime.datetime.now().time()
+            a = datetime.datetime.strptime(self.settings["schedule_from"], "%H:%M").time()
+            b = datetime.datetime.strptime(self.settings["schedule_to"], "%H:%M").time()
+            return (a <= now < b) if a <= b else (now >= a or now < b)
+        except Exception:
+            return True
+
+    def _on_main(self, fn):
+        """Runs fn on the Tk thread and waits for it (used by the queue worker)."""
+        done = threading.Event()
+        box = {}
+
+        def call():
+            try:
+                box["r"] = fn()
+            finally:
+                done.set()
+        self.root.after(0, call)
+        done.wait(30)
+        return box.get("r")
+
+    def start_dl_queue(self):
+        if self._queue_running:
+            return
+        if not any(j.get("status", "").startswith("Pending") for j in self.dl_queue):
+            messagebox.showinfo("Queue", "Nothing pending in the queue.")
+            return
+        self._queue_running = True
+        self._queue_pause_req = False
+        self.q_start_btn.config(state="disabled")
+        self.disable_buttons_for_run()
+        threading.Thread(target=self._queue_worker, daemon=True).start()
+
+    def _queue_worker(self):
+        finished = 0
+        try:
+            while True:
+                job = next((j for j in self.dl_queue if j.get("status", "").startswith("Pending")), None)
+                if job is None or self._queue_pause_req:
+                    break
+                while not self._in_schedule() and not self._queue_pause_req:
+                    job["status"] = "Waiting for schedule"
+                    self.root.after(0, self._refresh_queue_view)
+                    self.root.after(0, lambda: self.update_status(f"Queue waiting until {self.settings['schedule_from']}…", "orange"))
+                    time.sleep(20)
+                if self._queue_pause_req:
+                    job["status"] = "Pending"
+                    break
+                job["status"] = "Running"
+                self._save_queue()
+                self.root.after(0, self._refresh_queue_view)
+                ok = self._run_queue_job(job)
+                if self.stop_flag:
+                    job["status"] = "Pending (stopped — resumes next start)"
+                    self._save_queue()
+                    break
+                job["status"] = "Done ✅" if ok else "Failed ❌ (see log)"
+                job["finished"] = time.time()
+                if ok:
+                    finished += 1
+                self._save_queue()
+                self.root.after(0, self._refresh_queue_view)
+        finally:
+            self._queue_running = False
+            self.root.after(0, self._refresh_queue_view)
+            self.root.after(0, lambda: (self.q_start_btn.config(state="normal"), self.reset_buttons()))
+            pending = any(j.get("status", "").startswith("Pending") for j in self.dl_queue)
+            if not pending and not self.stop_flag and not self._queue_pause_req:
+                self.root.after(0, lambda: self._queue_finished(finished))
+
+    def _queue_finished(self, finished):
+        action = self.settings.get("queue_end_action", "notify")
+        msg = f"Download queue finished — {finished} item(s) downloaded."
+        self.update_status(msg, "green")
+        self.log_message(msg)
+        if action in ("notify", "shutdown"):
+            self.notify("Nader Downloader", msg)
+        if action == "shutdown":
+            if sys.platform == "win32":
+                subprocess.Popen(["shutdown", "/s", "/t", "120", "/c", "Nader Downloader finished the queue. Shutting down in 2 minutes."],
+                                 creationflags=0x08000000)
+                cancel_cmd = ["shutdown", "/a"]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e", 'delay 120', "-e", 'tell app "System Events" to shut down'])
+                cancel_cmd = None
+            else:
+                subprocess.Popen(["shutdown", "-h", "+2"])
+                cancel_cmd = ["shutdown", "-c"]
+            if messagebox.askyesno("Shutting down", "The computer will shut down in 2 minutes.\n\nCancel the shutdown?") and cancel_cmd:
+                subprocess.Popen(cancel_cmd)
+
+    def _run_queue_job(self, job) -> bool:
+        before = (self.last_output_file, os.path.getmtime(self.last_output_file) if self.last_output_file and os.path.exists(self.last_output_file) else 0)
+        self.stop_flag = False
+
+        def prep():
+            self.start_entry.delete(0, tk.END)
+            self.start_entry.insert(0, str(job.get("start", 1)))
+            self.total_entry.delete(0, tk.END)
+            self.total_entry.insert(0, str(job.get("total", "")))
+            self.update_status(f"Queue: {dict(self.QUEUE_TYPES).get(job['type'])} — {job['url'][:70]}", "blue")
+        self._on_main(prep)
+        self.log_message(f"{'='*50}\n--- QUEUE JOB: {job['type']} ---\n{job['url']}")
+        t = job["type"]
+        try:
+            if t == "narto_claude":
+                self.narto_claude_process(self.sanitize_url(job["url"]), max(1, min(6, int(self.settings.get("narto_workers", 3)))))
+            elif t == "tiktok_bulk":
+                self.download_bulk_process(job["url"])
+            elif t == "torrent":
+                src, kind = self.normalize_torrent_source(job["url"])
+                aria = self.get_aria2c_path()
+                if not src or not aria:
+                    self.log_message("Queue: torrent skipped (invalid link or aria2c missing).")
+                    return False
+                self.torrent_download_process(src, kind, aria)
+            else:
+                source = {"shortmax": 1, "narto": 2, "tiktok": 4, "dailymotion": 5, "direct": 3}[t]
+                self.download_process(self.sanitize_url(job["url"]), source, keep_buttons_locked=True)
+        except Exception as e:
+            self.log_message(f"Queue job crashed: {e}")
+            return False
+        after = self.last_output_file
+        return bool(after) and os.path.exists(after) and (after != before[0] or os.path.getmtime(after) > before[1])
+
+    # ---- Library page ----
+    def build_library_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["library"] = page
+        self._page_header(page, "📚 Library", "Everything you have downloaded, grouped by series. Double-click to play.")
+        top = ttk.Frame(page)
+        top.pack(fill="x", padx=14, pady=4)
+        ttk.Label(top, text="🔎 Search:").pack(side="left")
+        self.lib_search = ttk.Entry(top, width=40)
+        self.lib_search.pack(side="left", padx=6)
+        self.lib_search.bind("<KeyRelease>", lambda e: self.refresh_library())
+        ttk.Button(top, text="🔄 Refresh", command=self.refresh_library).pack(side="left", padx=4)
+        self.lib_summary = tk.Label(top, text="", font=("Arial", 9, "bold"), bg="#0b0f19", fg="#94a3b8")
+        self.lib_summary.pack(side="right")
+        box = ttk.LabelFrame(page, text="Series", padding=(10, 6))
+        box.pack(fill="both", expand=True, padx=14, pady=(4, 10))
+        cols = ("files", "size", "date")
+        self.lib_tree = ttk.Treeview(box, columns=cols, show="tree headings", height=16)
+        self.lib_tree.heading("#0", text="Series / file")
+        self.lib_tree.column("#0", width=520)
+        for c, w_, title in (("files", 90, "Videos"), ("size", 110, "Size"), ("date", 160, "Last download")):
+            self.lib_tree.heading(c, text=title)
+            self.lib_tree.column(c, width=w_, anchor="w")
+        self.lib_tree.pack(fill="both", expand=True)
+        self.lib_tree.bind("<Double-1>", lambda e: self._lib_open(play=True))
+        btns = ttk.Frame(box, style="Card.TFrame")
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="▶️ Play", style="Accent.TButton", command=lambda: self._lib_open(play=True)).pack(side="left", padx=2)
+        ttk.Button(btns, text="📂 Open Folder", command=lambda: self._lib_open(play=False)).pack(side="left", padx=2)
+        ttk.Button(btns, text="🗑️ Delete", style="Danger.TButton", command=self._lib_delete).pack(side="left", padx=2)
+        self._lib_paths = {}
+
+    def refresh_library(self):
+        if not hasattr(self, "lib_tree"):
+            return
+        q = self.lib_search.get().strip().lower()
+        self.lib_tree.delete(*self.lib_tree.get_children())
+        self._lib_paths = {}
+        total_size = n_series = 0
+        for e in self.scan_library():
+            if q and q not in e["name"].lower() and not any(q in os.path.basename(f).lower() for f in e["files"]):
+                continue
+            n_series += 1
+            total_size += e["size"]
+            when = datetime.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
+            sid = self.lib_tree.insert("", "end", text=f"🎬 {e['name']}", values=(len(e["files"]), f"{e['size'] / 1048576:.0f} MB", when), open=False)
+            self._lib_paths[sid] = ("series", os.path.dirname(e["files"][0]), e["files"])
+            for f in sorted(e["files"], key=lambda p: natural_sort_key(os.path.basename(p))):
+                fid = self.lib_tree.insert(sid, "end", text=os.path.basename(f),
+                                           values=("", f"{os.path.getsize(f) / 1048576:.1f} MB",
+                                                   datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M")))
+                self._lib_paths[fid] = ("file", f, [f])
+        self.lib_summary.config(text=f"{n_series} series  •  {total_size / 1073741824:.2f} GB")
+
+    def _lib_open(self, play=True):
+        sel = self.lib_tree.selection()
+        if not sel:
+            return
+        kind, path, files = self._lib_paths.get(sel[0], (None, None, []))
+        if not path:
+            return
+        if play:
+            self.open_last_file(files[0] if kind == "series" else path)
+        else:
+            self.open_last_local_folder(os.path.dirname(path) if kind == "file" else path)
+
+    def _lib_delete(self):
+        sel = self.lib_tree.selection()
+        if not sel:
+            return
+        kind, path, files = self._lib_paths.get(sel[0], (None, None, []))
+        if not files or not messagebox.askyesno("Delete", f"Delete {len(files)} file(s) from disk?\n\n" + "\n".join(os.path.basename(f) for f in files[:8])):
+            return
+        for f in files:
+            for extra in (f, os.path.splitext(f)[0] + ".srt"):
+                try:
+                    os.remove(extra)
+                except OSError:
+                    pass
+        self.refresh_library()
+
+    # ---- Settings & health page ----
+    def build_settings_page(self):
+        page = ttk.Frame(self.page_container)
+        self.pages["settings"] = page
+        self._page_header(page, "⚙️ Settings & Health", "Your choices are saved automatically.")
+        cols = ttk.Frame(page)
+        cols.pack(fill="both", expand=True, padx=14, pady=4)
+        left = ttk.LabelFrame(cols, text="🎨 Look & downloads", padding=(12, 8))
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.theme_choice_var = tk.StringVar(value=self.settings.get("theme", "auto"))
+        ttk.Label(left, text="Theme", background="#131b2e", font=("Arial", 10, "bold")).pack(anchor="w")
+        for val, title in (("auto", "Auto — follow my computer's setting"), ("dark", "Dark"), ("light", "Light")):
+            ttk.Radiobutton(left, text=title, value=val, variable=self.theme_choice_var,
+                            command=lambda: self.set_theme_choice(self.theme_choice_var.get())).pack(anchor="w", pady=1)
+        form = ttk.Frame(left, style="Card.TFrame")
+        form.pack(fill="x", pady=(10, 4))
+        ttk.Label(form, text="Maximum quality:", background="#131b2e").grid(row=0, column=0, sticky="w", pady=3)
+        self.quality_var = tk.StringVar(value={"best": "Best available", "1080": "1080p", "720": "720p", "480": "480p",
+                                               "smallest": "Smallest file"}[self.settings.get("max_quality", "best")])
+        qcb = ttk.Combobox(form, textvariable=self.quality_var, values=["Best available", "1080p", "720p", "480p", "Smallest file"], state="readonly", width=18)
+        qcb.grid(row=0, column=1, sticky="w", padx=6)
+        qcb.bind("<<ComboboxSelected>>", lambda e: self._save_download_prefs())
+        ttk.Label(form, text="Speed limit:", background="#131b2e").grid(row=1, column=0, sticky="w", pady=3)
+        self.speed_var = tk.StringVar(value=self.settings.get("speed_limit") or "Unlimited")
+        scb = ttk.Combobox(form, textvariable=self.speed_var, values=["Unlimited", "500K", "1M", "2M", "5M", "10M", "20M"], width=18)
+        scb.grid(row=1, column=1, sticky="w", padx=6)
+        scb.bind("<<ComboboxSelected>>", lambda e: self._save_download_prefs())
+        scb.bind("<FocusOut>", lambda e: self._save_download_prefs())
+        ttk.Label(form, text="(bytes per second, e.g. 5M = 5 MB/s)", background="#131b2e", foreground="#94a3b8").grid(row=1, column=2, sticky="w")
+        self.notify_var = tk.BooleanVar(value=bool(self.settings.get("notify", True)))
+        ttk.Checkbutton(left, text="🔔 Notify me when downloads finish", variable=self.notify_var, style="Card.TCheckbutton",
+                        command=lambda: (self.settings.__setitem__("notify", bool(self.notify_var.get())), self.save_settings())).pack(anchor="w", pady=4)
+        out_row = ttk.Frame(left, style="Card.TFrame")
+        out_row.pack(fill="x", pady=(8, 2))
+        ttk.Label(out_row, text="Save videos to:", background="#131b2e").pack(side="left")
+        self.out_dir_lbl = tk.Label(out_row, text=self.output_base, bg="#131b2e", fg="#38bdf8", font=("Arial", 9))
+        self.out_dir_lbl.pack(side="left", padx=6)
+        ttk.Button(left, text="📁 Change Folder…", command=self._change_output_dir).pack(anchor="w", pady=2)
+        tk.Label(left, text="Cookie files (optional, put next to this app):\n• shortmax_cookies.txt   • tiktok_cookies.txt\n"
+                            "Export them with a browser extension such as 'Get cookies.txt LOCALLY'.",
+                 justify="left", bg="#131b2e", fg="#94a3b8", font=("Arial", 9)).pack(anchor="w", pady=(12, 0))
+
+        right = ttk.LabelFrame(cols, text="🩺 Engines & updates", padding=(12, 8))
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.health_tree = ttk.Treeview(right, columns=("v",), show="tree headings", height=7)
+        self.health_tree.heading("#0", text="Engine")
+        self.health_tree.heading("v", text="Version / status")
+        self.health_tree.column("#0", width=190)
+        self.health_tree.column("v", width=360)
+        self.health_tree.pack(fill="x")
+        hb = ttk.Frame(right, style="Card.TFrame")
+        hb.pack(fill="x", pady=6)
+        ttk.Button(hb, text="🔄 Check Again", command=self.refresh_health).pack(side="left", padx=2)
+        self.update_btn = ttk.Button(hb, text="⬆️ Update yt-dlp (+ impersonation)", style="Accent.TButton", command=self.update_ytdlp)
+        self.update_btn.pack(side="left", padx=2)
+        tk.Label(right, text="Sites change often; most 'it stopped working' problems are fixed by updating yt-dlp.",
+                 bg="#131b2e", fg="#94a3b8", font=("Arial", 9), wraplength=520, justify="left").pack(anchor="w")
+        self.update_log = tk.Text(right, height=9, bg="#0f172a", fg="#cbd5e1", insertbackground="#ffffff", font=("Courier", 9),
+                                  relief="flat", highlightthickness=1, highlightbackground="#1e293b")
+        self.update_log.pack(fill="both", expand=True, pady=(6, 0))
+
+    def _save_download_prefs(self):
+        self.settings["max_quality"] = {"Best available": "best", "1080p": "1080", "720p": "720", "480p": "480",
+                                        "Smallest file": "smallest"}.get(self.quality_var.get(), "best")
+        sp = self.speed_var.get().strip()
+        self.settings["speed_limit"] = "" if sp.lower().startswith("unlim") or not sp else sp.upper().replace(" ", "")
+        self.save_settings()
+
+    def _change_output_dir(self):
+        d = filedialog.askdirectory(initialdir=self.output_base, title="Where should finished videos go?")
+        if d:
+            os.makedirs(d, exist_ok=True)
+            self.output_base = d
+            self.last_output_folder = d
+            self.settings["output_dir"] = d
+            self.save_settings()
+            self.out_dir_lbl.config(text=d)
+
+    def refresh_health(self):
+        self.health_tree.delete(*self.health_tree.get_children())
+        self.health_tree.insert("", "end", text="Checking…", values=("",))
+
+        def work():
+            rows = self.engine_versions()
+
+            def show():
+                self.health_tree.delete(*self.health_tree.get_children())
+                for name, val in rows:
+                    ok = not any(w in val for w in ("not found", "not working", "missing"))
+                    self.health_tree.insert("", "end", text=f"{'✅' if ok else '⚠️'}  {name}", values=(val,))
+            self.root.after(0, show)
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_ytdlp(self):
+        cmd = self.ytdlp_update_command()
+        self.update_btn.config(state="disabled")
+        self.update_log.delete("1.0", tk.END)
+        self.update_log.insert(tk.END, "$ " + " ".join(cmd) + "\n")
+
+        def work():
+            kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                        errors="ignore", bufsize=1, **kwargs)
+                for line in proc.stdout:
+                    self.root.after(0, lambda l=line: (self.update_log.insert(tk.END, l), self.update_log.see(tk.END)))
+                rc = proc.wait()
+            except Exception as e:
+                rc = -1
+                self.root.after(0, lambda: self.update_log.insert(tk.END, f"\n{e}\n"))
+            self.root.after(0, lambda: (self.update_log.insert(tk.END, "\n✅ Up to date.\n" if rc == 0 else f"\n⚠️ Update failed (code {rc}).\n"),
+                                        self.update_btn.config(state="normal"), self.refresh_health()))
+        threading.Thread(target=work, daemon=True).start()
 
     def get_accelerator_args(self, use_aria=True):
         if not self.turbo_var.get():
@@ -3898,6 +5240,7 @@ class DownloaderApp:
             return False
 
     def run_yt_dlp_with_progress(self, yt_dlp_cmd):
+        yt_dlp_cmd = self.with_global_args(yt_dlp_cmd)
         self.progress_bar['value'] = 0
         self.detail_label.config(text="Connecting to media server...")
         self.root.update_idletasks()
@@ -4202,7 +5545,8 @@ class DownloaderApp:
                 return
 
             target_dir = self.get_organized_output_dir(series_folder_name, "1_Downloaded_Merged")
-            temp_dir = os.path.join(target_dir, "temp_Bulk_Download")
+            # Stable folder (not dated) so a stopped or crashed bulk run resumes where it left off
+            temp_dir = os.path.join(self.output_base, "_resume", re.sub(r'[\\/:*?"<>|]+', "_", series_folder_name))
             os.makedirs(temp_dir, exist_ok=True)
 
             yt_dlp_path = self.get_yt_dlp_path()
@@ -4223,15 +5567,14 @@ class DownloaderApp:
 
                 self.update_status(f"Downloading Link {episode}/{len(urls)}...", "#38bdf8")
                 file_name = os.path.join(temp_dir, f"ep_{episode:03d}.mp4")
+                if self.is_valid_video_file(file_name):
+                    downloaded_files.append(file_name)
+                    last_saved_ep = episode
+                    self.log_message(f"Resume: Link {episode} already downloaded, skipping.")
+                    episode += 1
+                    continue
 
-                yt_dlp_cmd = [
-                    yt_dlp_path,
-                    "--cookies-from-browser", "chrome",
-                    *accel_args,
-                    "-o", file_name, url
-                ]
-
-                max_retries = 3
+                max_retries = 2
                 success = False
                 err = ""
 
@@ -4239,7 +5582,7 @@ class DownloaderApp:
                     if self.stop_flag:
                         break
 
-                    succ, stderr = self.run_yt_dlp_with_progress(yt_dlp_cmd)
+                    succ, stderr = self.download_tiktok_one(yt_dlp_path, url, file_name, accel_args)
 
                     if succ and self.is_valid_video_file(file_name):
                         self.normalize_clip_for_sync(file_name)
@@ -4271,20 +5614,21 @@ class DownloaderApp:
             range_str = f"EP{start_ep}-EP{last_saved_ep}" if start_ep != last_saved_ep else f"EP{start_ep}"
             final_output = os.path.join(target_dir, f"{series_folder_name}_{range_str}.mp4")
 
-            res = self.concat_video_files_synced(downloaded_files, final_output, normalize_first=False)
+            ok, msg = self.merge_clips_uniform(downloaded_files, final_output, "TikTok merge")
 
-            if res.returncode != 0:
-                 self.log_message(f"FFMPEG ERROR:\n{res.stderr}")
-            else:
-                self.record_last_output(final_output)
-                for file in downloaded_files:
-                    try: os.remove(file)
-                    except: pass
-                try: os.rmdir(temp_dir)
+            if not ok:
+                self.log_message(f"TikTok MERGE ERROR:\n{msg}")
+                self.update_status("Merge failed — the downloaded clips are kept for a retry. Check log.", "#f43f5e")
+                self.reset_buttons()
+                return
+            for file in downloaded_files:
+                try: os.remove(file)
                 except: pass
+            try: os.rmdir(temp_dir)
+            except: pass
 
-            self.update_status(f"Success! Bulk Merged up to Ep {last_saved_ep}.", "#10b981")
-            self.log_message(f"COMPLETED: Saved to {final_output}")
+            self.update_status(f"Success! Bulk Merged up to Ep {last_saved_ep}. {msg}.", "#10b981")
+            self.log_message(f"COMPLETED: Saved to {final_output} ({msg})")
 
         except Exception as e:
             import traceback
@@ -4336,6 +5680,8 @@ class DownloaderApp:
             return
 
         url = self.sanitize_url(raw_url)
+        if not self.confirm_not_duplicate(url):
+            return
         self.save_to_history(source, url)
         self.disable_buttons_for_run()
 
@@ -4375,6 +5721,8 @@ class DownloaderApp:
             return
 
         url = self.sanitize_url(raw_url)
+        if not self.confirm_not_duplicate(url):
+            return
         self.save_to_history(7, url)
         try:
             workers = max(1, min(6, int(self.narto_claude_parallel_var.get())))
@@ -4397,6 +5745,7 @@ class DownloaderApp:
 
     def run_ytdlp_tracked(self, cmd, on_pct):
         """Runs one yt-dlp download (several can run at once). Returns (ok, last output lines)."""
+        cmd = self.with_global_args(cmd)
         tail = []
         kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
         try:
@@ -4510,6 +5859,10 @@ class DownloaderApp:
             sched = {"next": start_ep, "stop_at": last_ep}
 
             def download_episode(ep):
+                done_file = os.path.join(temp_dir, f"ep_{ep:03d}.mp4")
+                if self.is_valid_video_file(done_file):
+                    self.log_message(f"Narto Claude: Resume — Episode {ep} was already downloaded, skipped.")
+                    return "ok"
                 cands = candidates_for(ep)
                 if not cands:
                     cands = candidates_for(ep, force=True)
@@ -4812,6 +6165,8 @@ class DownloaderApp:
             cmd += ["--seed-ratio=1.0", "--seed-time=30"]
         else:
             cmd += ["--seed-time=0"]
+        if self.settings.get("speed_limit"):
+            cmd.append(f"--max-overall-download-limit={self.settings['speed_limit']}")
         cmd.append(src)
         return cmd
 
@@ -4929,7 +6284,7 @@ class DownloaderApp:
 
     def update_status(self, text, color="#38bdf8"):
         color_map = {"blue": "#38bdf8", "green": "#10b981", "red": "#f43f5e", "orange": "#f59e0b", "black": "#f8fafc"}
-        c = color_map.get(color, color)
+        c = self.theme_fg(color_map.get(color, color))
         self.status_label.config(text=text, fg=c)
         self.root.update_idletasks()
 
@@ -5194,14 +6549,7 @@ class DownloaderApp:
                 target_dir = self.get_organized_output_dir(f"TikTok_{video_id}", "1_Downloaded_Merged")
                 file_name = os.path.join(target_dir, f"TikTok_{video_id}.mp4")
 
-                yt_dlp_cmd = [
-                    yt_dlp_path,
-                    *accel_args,
-                    "-o", file_name,
-                    url
-                ]
-
-                succ, err = self.run_yt_dlp_with_progress(yt_dlp_cmd)
+                succ, err = self.download_tiktok_one(yt_dlp_path, url, file_name, accel_args)
 
                 if succ and self.is_valid_video_file(file_name):
                     self.record_last_output(file_name)
@@ -5369,6 +6717,13 @@ class DownloaderApp:
                         break
 
                 file_name = os.path.join(temp_dir, f"ep_{episode:03d}.mp4")
+                if source == 1 and self.is_valid_video_file(file_name):
+                    cumulative_duration_sec += self.get_media_duration(file_name)
+                    downloaded_files.append(file_name)
+                    last_saved_ep = episode
+                    self.log_message(f"Resume: Episode {episode} was already downloaded — skipped.")
+                    episode += 1
+                    continue
                 if os.path.exists(file_name):
                     try: os.remove(file_name)
                     except: pass

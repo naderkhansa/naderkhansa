@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QLineEdit,
     QFormLayout, QProgressDialog, QColorDialog, QButtonGroup, QFrame, QSizePolicy, QListWidget, QListWidgetItem,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox, QProgressBar,
-    QAbstractSpinBox
+    QAbstractSpinBox, QSplitter
 )
 from PyQt6.QtCore import QSettings, Qt, QTimer, QRect, QRectF, QPoint, QPointF, QSize, pyqtSignal, QObject, QElapsedTimer, QBuffer, QByteArray, QIODevice
 from PyQt6.QtGui import (
@@ -99,7 +99,7 @@ NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # APPLICATION METADATA & VERSION CONTROL
 # ==============================================================================
 APP_NAME = "ANK Media Studio"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_AUTHOR = "Nader Alkhansa"
 
 # Expanded 12-Color Palette so every added video has its own unmistakable identity
@@ -2049,6 +2049,7 @@ def ytdlp_command():
 # INTERACTIVE CANVAS (With Drag & Drop + Right-Click Context Menu Support)
 # ==============================================================================
 class PhotoCanvas(QLabel):
+    frame_Shown = pyqtSignal()
     crop_Completed = pyqtSignal(QRect)
     free_Moved = pyqtSignal(int, int)
     wheel_Scaled = pyqtSignal(float)
@@ -2142,6 +2143,7 @@ class PhotoCanvas(QLabel):
         self.display_pixmap = QPixmap.fromImage(qimg)
         self._scaled_cache = None
         self.update()
+        self.frame_Shown.emit()
 
     def _scaled(self):
         size = self.size()
@@ -3196,6 +3198,8 @@ QCheckBox::indicator:checked { border-color: #93c5fd;
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: $scroll_bg; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: $scroll_handle; border-radius: 5px; min-height: 30px; }
+QSplitter::handle { background: transparent; }
+QSplitter::handle:hover { background: $scroll_handle; border-radius: 3px; }
 QScrollBar:horizontal { background: $scroll_bg; height: 10px; margin: 0; }
 QScrollBar::handle:horizontal { background: $scroll_handle; border-radius: 5px; min-width: 30px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
@@ -3300,6 +3304,189 @@ class Accordion(QWidget):
         self.currentChanged.emit(idx)
 
 
+
+# --- Pop-out monitor: a separate, resizable (or full-screen) window that mirrors the preview ---
+class MonitorView(QWidget):
+    """Draws the current preview frame as large as the window allows, plus an optional big subtitle caption."""
+    def __init__(self):
+        super().__init__()
+        self.pixmap = None
+        self.caption = ""
+        self.caption_pt = 30
+        self.setMinimumSize(320, 180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_frame(self, pixmap, caption=""):
+        self.pixmap = pixmap
+        self.caption = caption
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#000000"))
+        if self.pixmap is not None and not self.pixmap.isNull():
+            sc = self.pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap((self.width() - sc.width()) // 2, (self.height() - sc.height()) // 2, sc)
+        else:
+            p.setPen(QColor("#94A3B8"))
+            p.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a video in the Video Studio")
+        if self.caption:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            f = QFont("Segoe UI", self.caption_pt, QFont.Weight.Bold)
+            p.setFont(f)
+            fm = QFontMetrics(f)
+            box = QRect(30, 0, self.width() - 60, self.height())
+            br = fm.boundingRect(box, int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap), self.caption)
+            br.moveBottom(self.height() - max(20, self.height() // 14))
+            bg = br.adjusted(-16, -8, 16, 8)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawRoundedRect(bg, 10, 10)
+            path = QPainterPath()
+            y = br.top() + fm.ascent()
+            for line in self._wrap(fm, self.caption, box.width()):
+                path.addText(br.center().x() - fm.horizontalAdvance(line) / 2, y, f, line)
+                y += fm.lineSpacing()
+            p.setPen(QPen(QColor("#000000"), max(3, self.caption_pt // 7), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#FFFFFF"))
+            p.drawPath(path)
+
+    @staticmethod
+    def _wrap(fm, text, width):
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split():
+                trial = f"{cur} {word}".strip()
+                if fm.horizontalAdvance(trial) <= width or not cur:
+                    cur = trial
+                else:
+                    lines.append(cur)
+                    cur = word
+            lines.append(cur)
+        return lines
+
+
+class PopOutMonitor(QWidget):
+    """Resizable monitor window (F11 / double-click = full screen). Mirrors the Video Studio preview while you edit."""
+    def __init__(self, studio):
+        super().__init__(None, Qt.WindowType.Window)
+        self.studio = studio
+        self.setWindowTitle("ANK Monitor — drag the edges to resize  •  F11 / double-click = full screen  •  Space = play")
+        self.setWindowIcon(studio.windowIcon())
+        self.setStyleSheet(studio.styleSheet())
+        self.resize(1100, 700)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.view = MonitorView()
+        lay.addWidget(self.view, 1)
+        bar = QFrame()
+        bar.setObjectName("Transport")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(10, 4, 10, 4)
+        for icon, tip, fn in (("to_start", "Go to start", lambda: studio._seek_absolute(0)),
+                              ("step_back", "Back 1 second (←)", lambda: studio._seek_relative(-1000))):
+            b = tool_button("", icon, "slate", tip, size=30)
+            b.clicked.connect(fn)
+            bl.addWidget(b)
+        self.btn_play = tool_button("", "play", "green", "Play / Pause (Space)", size=40)
+        self.btn_play.clicked.connect(studio._toggle_playback)
+        bl.addWidget(self.btn_play)
+        b = tool_button("", "step_fwd", "slate", "Forward 1 second (→)", size=30)
+        b.clicked.connect(lambda: studio._seek_relative(1000))
+        bl.addWidget(b)
+        self.lbl_time = QLabel("00:00.000")
+        self.lbl_time.setObjectName("Clock")
+        bl.addWidget(self.lbl_time)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 1000)
+        self.slider.sliderMoved.connect(self._on_slider)
+        bl.addWidget(self.slider, 1)
+        self.chk_caption = QCheckBox("Big subtitles")
+        self.chk_caption.setChecked(True)
+        self.chk_caption.setToolTip("Show the current subtitle line in large, easy-to-read text (your Subtitles list)")
+        self.chk_caption.toggled.connect(lambda _: self.refresh())
+        bl.addWidget(self.chk_caption)
+        self.spn_caption = QSpinBox()
+        self.spn_caption.setRange(14, 90)
+        self.spn_caption.setValue(int(studio.settings.value("popout_caption_pt", 30)))
+        self.spn_caption.setSuffix(" pt")
+        self.spn_caption.setToolTip("Subtitle text size")
+        self.spn_caption.valueChanged.connect(self._on_caption_size)
+        bl.addWidget(self.spn_caption)
+        self.chk_top = QCheckBox("Always on top")
+        self.chk_top.toggled.connect(self._on_top)
+        bl.addWidget(self.chk_top)
+        self.btn_full = icon_button("Full Screen", "aspect", "blue", "Full screen (F11 or double-click); Esc to leave")
+        self.btn_full.clicked.connect(self.toggle_full)
+        bl.addWidget(self.btn_full)
+        lay.addWidget(bar)
+        self.view.caption_pt = self.spn_caption.value()
+        for keys, fn in ((Qt.Key.Key_Space, studio._toggle_playback), (Qt.Key.Key_F11, self.toggle_full),
+                         (Qt.Key.Key_Escape, self._escape), (Qt.Key.Key_Left, lambda: studio._seek_relative(-1000)),
+                         (Qt.Key.Key_Right, lambda: studio._seek_relative(1000)), ("F", self.toggle_full)):
+            QShortcut(QKeySequence(keys), self).activated.connect(fn)
+        geo = studio.settings.value("popout_geometry")
+        if geo is not None:
+            try:
+                self.restoreGeometry(geo)
+            except Exception:
+                pass
+
+    def _on_caption_size(self, v):
+        self.view.caption_pt = v
+        self.studio.settings.setValue("popout_caption_pt", v)
+        self.view.update()
+
+    def _on_top(self, on):
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        self.show()
+
+    def _on_slider(self, v):
+        total = self.studio.timeline.total_duration_ms()
+        if total > 0:
+            self.studio._seek_absolute(int(total * v / 1000))
+
+    def toggle_full(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _escape(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.close()
+
+    def mouseDoubleClickEvent(self, event):
+        self.toggle_full()
+
+    def refresh(self):
+        st = self.studio
+        ms = st.timeline.playhead_ms
+        caption = ""
+        if self.chk_caption.isChecked() and st.subtitles and not st.chk_output_view.isChecked():
+            cue = subtitle_at(st.subtitles, int(ms))
+            caption = (cue or {}).get("text", "") if isinstance(cue, dict) else (cue or "")
+        self.view.set_frame(st.video_Canvas.display_pixmap, caption)
+        total = st.timeline.total_duration_ms()
+        self.lbl_time.setText(f"{format_ms(ms)} / {format_ms(total)}")
+        if not self.slider.isSliderDown():
+            self.slider.setValue(int(1000 * ms / total) if total else 0)
+        self.btn_play.setIcon(QIcon(make_icon_pixmap("pause" if st.is_playing else "play", "green", 64)))
+
+    def closeEvent(self, event):
+        self.studio.settings.setValue("popout_geometry", self.saveGeometry())
+        super().closeEvent(event)
+        self.studio._on_popout_closed()
+
+
 class ANKMediaStudio(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3382,6 +3569,8 @@ class ANKMediaStudio(QMainWindow):
 
         video_only = lambda fn: (lambda: fn() if self.tabs.currentIndex() == 0 else None)
         sc(Qt.Key.Key_Space, self._shortcut_space)
+        sc("Ctrl+M", lambda: self.tabs.currentIndex() == 0 and self.btn_big_monitor.toggle())
+        sc("Ctrl+Shift+M", lambda: self.tabs.currentIndex() == 0 and self.btn_popout.toggle())
         sc("Ctrl+Z", self._shortcut_undo)
         sc("Ctrl+Y", self._shortcut_redo)
         sc("Ctrl+Shift+Z", self._shortcut_redo)
@@ -3424,6 +3613,8 @@ class ANKMediaStudio(QMainWindow):
     def _apply_theme(self):
         name = resolve_theme(self.theme_choice)
         self.setStyleSheet(build_stylesheet(name))
+        if getattr(self, "popout", None) is not None:
+            self.popout.setStyleSheet(self.styleSheet())
         for canvas in (self.video_Canvas, self.photo_canvas):
             canvas._update_border_style()
             canvas.update()
@@ -3656,8 +3847,11 @@ class ANKMediaStudio(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
-        top_split = QHBoxLayout()
-        top_split.setSpacing(10)
+        # v3.1: drag the splitter handles to make the monitor bigger or smaller
+        top_split = QSplitter(Qt.Orientation.Horizontal)
+        top_split.setChildrenCollapsible(False)
+        top_split.setHandleWidth(8)
+        self.video_hsplit = top_split
 
         # Left: Video Monitor + transport + clip info
         monitor_box = QVBoxLayout()
@@ -3717,6 +3911,13 @@ class ANKMediaStudio(QMainWindow):
             b = tool_button("", icon, "pink", tip, size=28)
             b.clicked.connect(fn)
             tl.addWidget(b)
+        tl.addSpacing(6)
+        self.btn_big_monitor = tool_button("", "aspect", "blue", "Big monitor: hide the side panel and give the picture more room (Ctrl+M)", size=30, checkable=True)
+        self.btn_big_monitor.toggled.connect(self._set_big_monitor)
+        tl.addWidget(self.btn_big_monitor)
+        self.btn_popout = tool_button("", "eye", "blue", "Pop out the monitor into its own window — resize it or make it full screen (Ctrl+Shift+M)", size=30, checkable=True)
+        self.btn_popout.toggled.connect(self._toggle_popout)
+        tl.addWidget(self.btn_popout)
         monitor_box.addWidget(transport)
 
         info_bar = QHBoxLayout()
@@ -3733,7 +3934,10 @@ class ANKMediaStudio(QMainWindow):
         self.sources_legend_layout.addWidget(lbl_leg)
         self.sources_legend_layout.addStretch()
         monitor_box.addLayout(self.sources_legend_layout)
-        top_split.addLayout(monitor_box, stretch=3)
+        monitor_w = QWidget()
+        monitor_box.setContentsMargins(0, 0, 0, 0)
+        monitor_w.setLayout(monitor_box)
+        top_split.addWidget(monitor_w)
 
         # Right: Inspector (accordion of tool sections)
         inspector = Accordion()
@@ -4250,8 +4454,22 @@ class ANKMediaStudio(QMainWindow):
         right_wrap.setWidgetResizable(True)
         right_wrap.setMinimumWidth(490)
         right_wrap.setWidget(inspector)
-        top_split.addWidget(right_wrap, stretch=1)
-        layout.addLayout(top_split, stretch=3)
+        top_split.addWidget(right_wrap)
+        top_split.setStretchFactor(0, 3)
+        top_split.setStretchFactor(1, 1)
+        self.inspector_wrap = right_wrap
+        self.video_vsplit = QSplitter(Qt.Orientation.Vertical)
+        self.video_vsplit.setChildrenCollapsible(False)
+        self.video_vsplit.setHandleWidth(8)
+        self.video_vsplit.addWidget(top_split)
+        bottom_w = QWidget()
+        bottom = QVBoxLayout(bottom_w)
+        bottom.setContentsMargins(0, 0, 0, 0)
+        self.video_vsplit.addWidget(bottom_w)
+        self.video_vsplit.setStretchFactor(0, 3)
+        self.video_vsplit.setStretchFactor(1, 1)
+        layout.addWidget(self.video_vsplit)
+        layout = bottom   # the timeline goes into the lower half of the splitter
 
         # Bottom Section: Scrollable & Zoomable Multi-Stem Timeline
         tl_bar = QHBoxLayout()
@@ -4287,9 +4505,19 @@ class ANKMediaStudio(QMainWindow):
 
         self.timeline_scroll = QScrollArea()
         self.timeline_scroll.setWidgetResizable(True)
-        self.timeline_scroll.setFixedHeight(286)
+        self.timeline_scroll.setMinimumHeight(130)
         self.timeline_scroll.setWidget(self.timeline)
         layout.addWidget(self.timeline_scroll)
+        self.video_vsplit.setSizes([700, 320])
+        for key, sp in (("video_vsplit", self.video_vsplit), ("video_hsplit", self.video_hsplit)):
+            st = self.settings.value(key)
+            if st is not None:
+                try:
+                    sp.restoreState(st)
+                except Exception:
+                    pass
+        self.popout = None
+        self.video_Canvas.frame_Shown.connect(self._sync_popout)
 
         return tab
 
@@ -6771,6 +6999,47 @@ class ANKMediaStudio(QMainWindow):
             self.video_Canvas.mode = "none"
         self._render_frame_at_ms(self.timeline.playhead_ms)
 
+
+    # ==========================================================================
+    # v3.1: BIG MONITOR & POP-OUT MONITOR
+    # ==========================================================================
+    def _set_big_monitor(self, on: bool):
+        """Hides the side panel and shrinks the timeline so the picture gets most of the window."""
+        if on:
+            self._split_before_big = (self.video_hsplit.saveState(), self.video_vsplit.saveState())
+            self.inspector_wrap.hide()
+            total = sum(self.video_vsplit.sizes())
+            self.video_vsplit.setSizes([int(total * 0.8), max(130, int(total * 0.2))])
+            self.status.showMessage("Big monitor on — Ctrl+M or the button again to bring the side panel back. Drag the bar above the timeline to resize.")
+        else:
+            self.inspector_wrap.show()
+            prev = getattr(self, "_split_before_big", None)
+            if prev:
+                self.video_hsplit.restoreState(prev[0])
+                self.video_vsplit.restoreState(prev[1])
+
+    def _toggle_popout(self, on: bool):
+        if on:
+            if self.popout is None:
+                self.popout = PopOutMonitor(self)
+            self.popout.show()
+            self.popout.raise_()
+            self.popout.activateWindow()
+            self.popout.refresh()
+            if self.video_Canvas.display_pixmap is None and self.timeline.segments:
+                self._render_frame_at_ms(self.timeline.playhead_ms)
+        elif self.popout is not None and self.popout.isVisible():
+            self.popout.close()
+
+    def _on_popout_closed(self):
+        self.btn_popout.blockSignals(True)
+        self.btn_popout.setChecked(False)
+        self.btn_popout.blockSignals(False)
+
+    def _sync_popout(self):
+        if self.popout is not None and self.popout.isVisible():
+            self.popout.refresh()
+
     # ==========================================================================
     # v3: TRANSITIONS & MOTION
     # ==========================================================================
@@ -8088,6 +8357,11 @@ class ANKMediaStudio(QMainWindow):
             j["cancel"] = True
         self.play_timer.stop()
         self._stop_preview_audio()
+        self.settings.setValue("video_vsplit", self.video_vsplit.saveState())
+        if not self.btn_big_monitor.isChecked():
+            self.settings.setValue("video_hsplit", self.video_hsplit.saveState())
+        if self.popout is not None:
+            self.popout.close()
         for r in self.open_captures.values():
             r.release()
         self.settings.setValue("clean_exit", "true")
