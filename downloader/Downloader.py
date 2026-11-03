@@ -771,7 +771,7 @@ class NaderPlayer:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.1"
+        self.version = "v1.9.2"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -859,6 +859,7 @@ class DownloaderApp:
         self.theme_pill = self.make_3d_pill(nav_pills, {"auto": "🌓 Auto", "dark": "🌙 Dark", "light": "☀️ Light"}.get(self.settings.get("theme"), "🌓 Auto"),
                                             self.cycle_theme)
         self.theme_pill.pack(side="left", padx=(8, 2), pady=8)
+        self.setup_info_mode(nav_pills)
 
         # Nav pills get space first; a long page title is clipped instead of pushing the pills off-screen
         # v1.9.0: the page title gets its own slim bar so all navigation pills fit
@@ -885,6 +886,7 @@ class DownloaderApp:
         self.build_narto_queue_page()
         self.build_trim_crop_page()
         self.build_extra_pages()
+        self.attach_field_help()
         self.apply_saved_settings()
         self.apply_ui_theme(force=True)
         self.root.after(20000, self._watch_os_theme)
@@ -4643,6 +4645,10 @@ class DownloaderApp:
             args += ["--impersonate", "chrome", "--extractor-args", "generic:impersonate"]
         return args
 
+    @staticmethod
+    def is_http_403(err):
+        return bool(re.search(r"HTTP Error 403|403: Forbidden|status code 403", err or "", re.IGNORECASE))
+
     def shortmax_recover_from_error(self, err):
         """True when the failure was cookies/impersonation and the next attempt uses a different setup."""
         if "impersonate target" in err.lower() and getattr(self, "_sm_impersonate_ok", None):
@@ -4650,7 +4656,8 @@ class DownloaderApp:
             self.log_message("Shortmax: impersonation failed, retrying without it.")
             return True
         # A Cloudflare 403 means this browser's cookies don't carry a passed check: try the next browser
-        if self.SHORTMAX_COOKIE_ERR.search(err) or "cloudflare" in err.lower():
+        # v1.9.2: Shortmax now answers a plain "HTTP Error 403: Forbidden" (no 'Cloudflare' word) — same meaning
+        if self.SHORTMAX_COOKIE_ERR.search(err) or "cloudflare" in err.lower() or self.is_http_403(err):
             chain = self.shortmax_cookie_chain()
             idx = getattr(self, "_sm_cookie_idx", 0)
             if idx < len(chain) - 1:
@@ -4800,7 +4807,7 @@ class DownloaderApp:
         "theme": "auto", "max_quality": "best", "speed_limit": "", "notify": True,
         "queue_end_action": "notify", "schedule_on": False, "schedule_from": "01:00", "schedule_to": "07:00",
         "turbo": True, "sync_lock": True, "auto_sub": True, "narto_workers": 3, "output_dir": "",
-        "fme_monitor": "Small",
+        "fme_monitor": "Small", "info_mode": False, "opensubtitles_key": "",
     }
 
     def load_settings(self):
@@ -4892,6 +4899,286 @@ class DownloaderApp:
     def cycle_theme(self):
         order = ["auto", "dark", "light"]
         self.set_theme_choice(order[(order.index(self.settings.get("theme", "auto")) + 1) % 3])
+
+
+    # =========================================================================
+    # ℹ️ INFO MODE (v1.9.2): turn it on with the ℹ️ button, then point at anything
+    # =========================================================================
+    HELP_EXACT = {
+        "⬅️ Back": ("Back", "Returns to the page you were on before."),
+        "🏠 Home": ("Home / Dashboard", "The main downloader: paste a link in one of the site tabs and press its Start / Download button."),
+        "📋 Queue": ("Download Queue", "Line up many downloads (series, TikTok lists, torrents). They run one after another, survive a restart, "
+                                     "resume where they stopped, can run only at night, and can notify you or shut the PC down when finished."),
+        "📚 Library": ("Library", "All your finished videos as posters, like a streaming app. Play them in Nader Player (voice-sync fix, "
+                                 "Arabic subtitles), share them (AirDrop, Bluetooth, Blip) or delete them."),
+        "🎙️ Sync": ("Voice & Subtitle Sync Studio", "Fixes a finished movie whose sound or subtitles are early/late: one exact shift, "
+                                                    "automatic speed + offset matching, or repair of drift that starts in the middle."),
+        "🎛️ Edit": ("Full Manual Edit", "3-track editor: video, voice and background music are separated so you can slide, cut, trim, "
+                                       "copy or mute each one alone, then save the full movie in the same HD quality."),
+        "🌙 Narto 5": ("Narto 5-Movie Overnight Queue", "The original overnight queue for up to 5 Narto series, downloaded one by one."),
+        "✂️ Trim": ("Trim & Crop HD", "Cut parts out of one or many videos, crop black bars or edges, and join the pieces in the order you choose."),
+        "⚙️ Settings": ("Settings & Health", "Theme, maximum quality, speed limit, notifications, save folder, and the status of every engine "
+                                            "(yt-dlp, FFmpeg, aria2c). Includes one-click Update yt-dlp."),
+        "🌓 Auto": ("Theme: Auto", "Follows your computer's dark/light setting. Click to switch to Dark, again for Light."),
+        "🌙 Dark": ("Theme: Dark", "Dark colours. Click to switch to Light."),
+        "☀️ Light": ("Theme: Light", "Light colours. Click to go back to Auto (follow the computer)."),
+        "ℹ️ Info": ("Info mode", "While this is ON, pointing at any button, tab or box shows what it does. Click it again to turn the info off."),
+        "Shortmax": ("Shortmax tab", "Downloads a Shortmax series episode by episode and merges them. If the site shows its bot check, press "
+                                     "'1. Verify Bot Check', pass it in your browser, then '2. Start Shortmax'. A shortmax_cookies.txt next to the app is used first."),
+        "Narto (Original)": ("Narto (Original) tab", "The original, proven narto-drama.com downloader: one episode at a time, stream tokens "
+                                                     "refreshed automatically, subtitles merged into one .srt."),
+        "Narto ⚡ Claude Version": ("Narto ⚡ Claude Version tab", "Faster narto-drama.com downloader: several episodes at the same time "
+                                                                 "(choose how many), same token healing and subtitles, resumes if stopped."),
+        "Dailymotion": ("Dailymotion tab", "Downloads a Dailymotion video in the best quality available."),
+        "TikTok": ("TikTok tab", "One TikTok video, or a whole list from 'tiktok link graber.txt' merged into one video. "
+                                 "Videos of different sizes are made uniform so the merge never breaks."),
+        "Direct M3U8/MP4": ("Direct link tab", "Any direct video link (.m3u8 stream or .mp4 file) — e.g. one you copied from your browser's network tab."),
+        "Torrent / Magnet": ("Torrent tab", "Downloads a magnet link or .torrent file with the fast aria2c engine. Optional seeding after download."),
+    }
+    HELP_KEYS = [
+        ("Verify Bot Check", "Verify bot check", "Opens the site in your browser. Pass the check there (play an episode), close the browser, then press Start."),
+        ("Start Shortmax", "Start Shortmax", "Downloads every episode from the Start Ep (up to Total Eps if set), sync-locks each one and merges them into one movie."),
+        ("Download Narto", "Download Narto (Original)", "Starts the original narto-drama.com downloader with the Start / Total episodes below."),
+        ("Turbo Download (Claude", "Turbo download (Claude version)", "Downloads several Narto episodes at once (see 'Episodes at once'), then merges them with locked sound."),
+        ("Episodes at once", "Episodes at once", "How many Narto episodes download at the same time. 3 is a good balance; more can be faster on a strong connection."),
+        ("Dailymotion (Max", "Download Dailymotion", "Downloads the Dailymotion link in the best quality."),
+        ("Single TikTok", "Download single TikTok", "Downloads the one TikTok link (H.264 so it plays everywhere)."),
+        ("Bulk TikTok", "Bulk TikTok", "Reads 'tiktok link graber.txt' (next to the app, on the Desktop/Dramadownload or in Downloads), downloads every link and merges them."),
+        ("Single Video", "Download direct video", "Downloads the direct .m3u8 / .mp4 link."),
+        ("Torrent / Magnet", "Download torrent", "Starts the torrent / magnet download with aria2c (many connections, DHT and extra trackers)."),
+        ("Keep Seeding", "Keep seeding", "After the download, keeps sharing it with others for up to 30 minutes or until you uploaded as much as you downloaded."),
+        ("Paste", "Paste", "Puts the link from your clipboard into the box."),
+        ("History", "History", "Your last links for this site — pick one to use it again."),
+        ("Clear History", "Clear history", "Forgets the saved links of this site."),
+        ("Browse", "Browse", "Choose a file from your computer."),
+        ("Turbo Accelerator", "Turbo Accelerator", "Uses many connections at once (and aria2c when possible) for much faster downloads. Turn off on a weak connection."),
+        ("Sync-Lock", "Sync-Lock (keeps the voice in sync)", "Every episode's sound is locked to its picture and the merge rebuilds the sound sample-exactly, "
+                                                           "so the voice never drifts away from the video. An automatic check is written to the log after each merge."),
+        ("Auto-Save Merged .SRT", "Save subtitles", "Saves the Narto subtitles of all episodes as one .srt next to the movie, shifted to the right times."),
+        ("Add to Queue", "Add to Queue", "Puts the link of the open tab (with Start / Total episodes) into the Download Queue instead of starting now."),
+        ("Add Current Dashboard Link", "Add dashboard link", "Copies the link from the dashboard tab that is open into the queue."),
+        ("Start Queue", "Start Queue", "Downloads every pending item, one by one."),
+        ("Pause After Current", "Pause queue", "Lets the current download finish, then stops. Press Start Queue to continue."),
+        ("Retry", "Retry", "Marks the selected (failed) item as pending again."),
+        ("Remove", "Remove", "Removes the selected item from the queue."),
+        ("Clear Finished", "Clear finished", "Removes all finished items from the list."),
+        ("Only download between", "Schedule", "Downloads only between these hours (e.g. at night). Outside them the queue waits."),
+        ("Stop Download", "Stop", "Stops the running download. Finished episodes are kept and merged."),
+        ("Select Folder to Merge", "Merge a folder", "Joins all videos in a folder you choose into one movie (with locked sound)."),
+        ("Stitch Multiple Videos", "Stitch videos", "Pick several videos and join them in the order you choose."),
+        ("Open Last File", "Open last file", "Plays the last finished video."),
+        ("Open Last Local Folder", "Open folder", "Opens the folder of the last finished video."),
+        ("Open Error Log", "Error log", "Shows the log with every step and error (useful when something fails)."),
+        ("Voice & Subtitle Sync Studio", "Sync Studio", "Opens the studio that fixes sound/subtitle timing in a finished movie."),
+        ("Full Manual Edit", "Full Manual Edit", "Opens the 3-track editor (video, voice, music)."),
+        ("Overnight Queue", "Narto overnight queue", "Opens the 5-series Narto overnight queue."),
+        ("Trim & Crop", "Trim & Crop", "Opens the trim, crop and join studio."),
+        ("Pop-Out", "Pop-out monitor", "Opens the preview in its own window — drag its edges to make it as big as you like, F11 for full screen."),
+        ("Monitor size", "Monitor size", "Makes the preview inside the editor smaller or bigger."),
+        ("Load & Separate", "Load & separate", "Loads the video and splits it into video, voice and background music tracks."),
+        ("Separate Voice & Background", "Separate tracks", "Uses AI to split voice and music so each can be moved alone (slower, best quality)."),
+        ("Fast Mode", "Fast mode", "Keeps the full sound on the voice track — loads instantly, no separation."),
+        ("Play (Space)", "Play / Pause", "Plays or pauses the preview (Space key)."),
+        ("Lock Hand Tool", "Hand tool lock", "Keeps the hand tool on so you can drag tracks without holding Shift."),
+        ("Split at Playhead", "Split", "Cuts the selected track at the red playhead line (S key)."),
+        ("Trim Start to Playhead", "Trim start", "Removes the part of the selected clip before the playhead."),
+        ("Trim End to Playhead", "Trim end", "Removes the part of the selected clip after the playhead."),
+        ("Copy", "Copy", "Copies the selected clip."),
+        ("Paste Here", "Paste here", "Pastes the copied clip at the playhead."),
+        ("Delete (Del)", "Delete clip", "Deletes the selected clip (Del key)."),
+        ("Undo", "Undo", "Undoes the last edit (Ctrl+Z)."),
+        ("Reset Tracks", "Reset tracks", "Puts all tracks back as they were after loading."),
+        ("Shift Selected Clip by Difference", "Quick sync shift", "Moves the selected track by the difference between when a word is heard and when it should be heard."),
+        ("Speed-Stretch", "Speed-stretch", "Slightly speeds up / slows down the clip so it ends exactly where it should (fixes slow drift)."),
+        ("Save Full Movie", "Save movie", "Saves the edited movie in the same Full HD quality (no re-compression of the picture)."),
+        ("Check 15s", "15 s preview", "Plays 15 seconds from the playhead with the edited sound, to check before saving."),
+        ("Sync & Save FULL Movie", "Sync & save", "Applies the timing fix to the whole movie and saves a new copy."),
+        ("Preview 20s", "20 s test clip", "Makes a 20-second test with the fix so you can check it first."),
+        ("Auto-Sync Voice with Subtitles", "Auto-sync voice", "Listens to the dialogue and matches it to the subtitles automatically (speed + offset)."),
+        ("Auto-Repair Mid-Video", "Repair drift", "Fixes sound that is fine at the start but slowly goes out of sync later."),
+        ("Constant Flat Shift", "Flat shift", "Use when the sound is off by the same amount everywhere."),
+        ("Add Videos", "Add videos", "Adds videos to the pool (you can also drag & drop them)."),
+        ("Add Trim Segment", "Add segment", "Adds the selected part (with crop) to the timeline below."),
+        ("Export HD Video", "Export", "Joins all timeline segments into one HD video."),
+        ("Set Current Frame as Trim Start", "Set start", "Uses the frame you see as the start of the cut."),
+        ("Set Current Frame as Trim End", "Set end", "Uses the frame you see as the end of the cut."),
+        ("Play Any Video", "Play any video", "Opens any video file from your computer in Nader Player."),
+        ("Resume", "Resume", "Continues the video where you stopped last time."),
+        ("Play", "Play", "Opens the video in Nader Player: voice-sync fix, Arabic subtitles, auto-sync, speed, voice boost."),
+        ("Share", "Share", "Send the video with AirDrop (Mac), Bluetooth or Blip, copy it, or show it in its folder."),
+        ("🗑", "Delete", "Deletes the video from your computer (asks 'Are you sure?' first)."),
+        ("Arabic", "Arabic subtitles", "Loads Arabic subtitles: an existing .ar.srt, OpenSubtitles (if you added a key) or a translation of the video's subtitles."),
+        ("Auto-sync to voice", "Auto-sync subtitles", "Listens to the dialogue around the current scene and moves the subtitles to match the voice."),
+        ("Load .srt", "Load subtitles", "Choose a subtitle file to show on the video."),
+        ("Find online", "Find subtitles online", "Searches OpenSubtitles.com (needs a free API key, asked once)."),
+        ("Voice boost", "Voice boost", "Makes quiet dialogue louder and loud scenes softer — great at night."),
+        ("Full Screen", "Full screen", "Switches the player to full screen."),
+        ("Snapshot", "Snapshot", "Saves a picture of the current frame."),
+        ("Update yt-dlp", "Update yt-dlp", "Updates the download engine and its browser-impersonation part. Fixes most 'it stopped working' problems."),
+        ("Check Again", "Check engines", "Checks again which engines are installed and working."),
+        ("Change Folder", "Save folder", "Choose where finished videos are saved."),
+        ("Notify me", "Notifications", "Shows a desktop notification when a download finishes."),
+        ("Frame", "Step one frame", "Moves exactly one video frame back or forward — for finding the perfect cut point."),
+        ("Auto — follow", "Theme: Auto", "Follows your computer's dark / light setting."),
+        ("Optional: Add 2nd Checkpoint", "Second checkpoint", "A second matching point later in the movie, so the fix can also correct sound that slowly drifts."),
+        ("Open Last", "Open last result", "Plays the last movie this studio saved."),
+        ("Open Local Folder", "Open folder", "Opens the folder where this studio saved its result."),
+        ("Delete", "Delete", "Deletes the selected clip / item."),
+        ("Move Clip Up", "Move up", "Moves the selected segment earlier in the final video."),
+        ("Move Clip Down", "Move down", "Moves the selected segment later in the final video."),
+        ("Export Full HD", "Export", "Joins all segments into one Full HD video."),
+        ("Video Alone", "Select video track", "Selects the picture track — the slide / cut buttons then act on the video only."),
+        ("Voice Alone", "Select voice track", "Selects the voice track — move or cut the dialogue without touching picture or music."),
+        ("Music Alone", "Select music track", "Selects the background-music track — move, cut or mute the music alone."),
+        ("File…", "Choose file", "Pick a TikTok link list (.txt) or a .torrent file for the queue."),
+        ("Add All Pool Videos", "Add all", "Adds every video of the pool to the timeline as whole segments."),
+        ("Refresh Crop Frame", "Refresh", "Redraws the crop preview with the current values."),
+        ("Progressive Speed-Lock", "Progressive speed-lock", "Best for drift: gently changes the sound speed so it matches at both checkpoints."),
+        ("Stop / Cancel", "Stop", "Stops the job that is running."),
+        ("Stop Queue", "Stop queue", "Stops the overnight queue after stopping the running movie."),
+        ("Stop Task", "Stop", "Stops the editing job that is running."),
+        ("Dark", "Theme: Dark", "Dark colours."),
+        ("Light", "Theme: Light", "Light colours."),
+        ("🔄", "Refresh", "Reloads the list."),
+        ("⬆️", "Move up", "Moves the selected queue item up (it will download sooner)."),
+        ("⬇️", "Move down", "Moves the selected queue item down."),
+    ]
+
+    def setup_info_mode(self, nav_parent):
+        self.info_pill = self.make_3d_pill(nav_parent, "ℹ️ Info", self.toggle_info_mode)
+        self.info_pill.pack(side="left", padx=(8, 2), pady=8)
+        self._info_tip = None
+        self._info_job = None
+        self._info_target = None
+        self.root.bind_all("<Enter>", self._info_enter, add="+")
+        self.root.bind_all("<Leave>", self._info_leave, add="+")
+        self.root.bind_all("<Motion>", self._info_motion, add="+")
+        self.root.bind_all("<ButtonPress>", lambda e: self._info_hide(), add="+")
+        if self.settings.get("info_mode"):
+            self.set_pill_kind(self.info_pill, "blue")
+
+    def toggle_info_mode(self):
+        on = not self.settings.get("info_mode", False)
+        self.settings["info_mode"] = on
+        self.save_settings()
+        self.set_pill_kind(self.info_pill, "blue" if on else "dark")
+        self._info_hide()
+        self.update_status("ℹ️ Info is ON — point at any button, tab or box to see what it does." if on else "Info is off.",
+                           "blue" if on else "orange")
+
+    def _help_for(self, w, x_root=None, y_root=None):
+        h = getattr(w, "_help", None)
+        if h:
+            return h
+        text = ""
+        try:
+            if isinstance(w, ttk.Notebook) and x_root is not None:
+                idx = w.index(f"@{x_root - w.winfo_rootx()},{y_root - w.winfo_rooty()}")
+                text = w.tab(idx, "text")
+            else:
+                text = str(w.cget("text"))
+        except Exception:
+            return None
+        t = text.strip()
+        if not t:
+            return None
+        if t in self.HELP_EXACT:
+            return self.HELP_EXACT[t]
+        if re.fullmatch(r"[⏩⏪▶◀\s]*[+\-−]?\d+(\.\d+)?s", t):
+            return ("Jump / nudge " + re.sub(r"[⏩⏪▶◀\s]", "", t),
+                    "Moves the playhead by this many seconds. In 'Slide Selected' it moves only the selected track (video, voice or music) "
+                    "— use it to fix sound that is early or late.")
+        for key, title, body in self.HELP_KEYS:
+            if key.lower() in t.lower():
+                return title, body
+        return None
+
+    def _info_enter(self, e):
+        if not self.settings.get("info_mode"):
+            return
+        self._info_schedule(e.widget, e.x_root, e.y_root)
+
+    def _info_motion(self, e):
+        if not self.settings.get("info_mode"):
+            return
+        if isinstance(e.widget, ttk.Notebook):
+            h = self._help_for(e.widget, e.x_root, e.y_root)
+            if h != getattr(self, "_info_shown", None):
+                self._info_hide()
+                self._info_schedule(e.widget, e.x_root, e.y_root)
+        elif self._info_tip is not None and e.widget is self._info_target:
+            self._info_tip.geometry(f"+{e.x_root + 16}+{e.y_root + 20}")
+
+    def _info_schedule(self, w, x, y):
+        if not isinstance(w, tk.Misc) or w is self._info_tip:
+            return
+        if self._info_job:
+            self.root.after_cancel(self._info_job)
+        self._info_target = w
+        self._info_job = self.root.after(300, lambda: self._info_show(w, x, y))
+
+    def _info_leave(self, e):
+        if e.widget is self._info_target:
+            self._info_hide()
+
+    def _info_hide(self):
+        if getattr(self, "_info_job", None):
+            self.root.after_cancel(self._info_job)
+            self._info_job = None
+        if getattr(self, "_info_tip", None) is not None:
+            try: self._info_tip.destroy()
+            except Exception: pass
+        self._info_tip = None
+        self._info_shown = None
+
+    def _info_show(self, w, x, y):
+        self._info_job = None
+        if not self.settings.get("info_mode"):
+            return
+        try:
+            h = self._help_for(w, x, y)
+        except Exception:
+            h = None
+        if not h:
+            return
+        self._info_hide()
+        light = getattr(self, "_theme_now", "dark") == "light"
+        bg, fg, acc = ("#ffffff", "#0f172a", "#0369a1") if light else ("#111827", "#e2e8f0", "#38bdf8")
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        try: tip.attributes("-topmost", True)
+        except Exception: pass
+        box = tk.Frame(tip, bg=bg, highlightthickness=1, highlightbackground=acc)
+        box.pack()
+        tk.Label(box, text="ℹ️  " + h[0], bg=bg, fg=acc, font=("Arial", 10, "bold"), anchor="w", justify="left").pack(fill="x", padx=10, pady=(7, 2))
+        tk.Label(box, text=h[1], bg=bg, fg=fg, font=("Arial", 9), wraplength=360, justify="left", anchor="w").pack(fill="x", padx=10, pady=(0, 8))
+        tip.update_idletasks()
+        sx = min(x + 16, self.root.winfo_screenwidth() - tip.winfo_reqwidth() - 8)
+        sy = y + 20 if y + 20 + tip.winfo_reqheight() < self.root.winfo_screenheight() else y - tip.winfo_reqheight() - 12
+        tip.geometry(f"+{sx}+{sy}")
+        self._info_tip = tip
+        self._info_shown = h
+
+    def attach_field_help(self):
+        """Help for boxes that have no text of their own."""
+        fields = [
+            ("url_entry1", ("Shortmax link", "Paste a Shortmax watch link here (any episode of the series).")),
+            ("url_entry2", ("Narto link", "Paste a narto-drama.com watch link (any episode of the series).")),
+            ("url_entry7", ("Narto link (Claude version)", "Paste a narto-drama.com watch link; several episodes download at once.")),
+            ("url_entry5", ("Dailymotion link", "Paste a Dailymotion video link.")),
+            ("url_entry4", ("TikTok link", "Paste a TikTok video link.")),
+            ("url_entry3", ("Direct link", "Paste a direct .m3u8 or .mp4 link.")),
+            ("url_entry6", ("Magnet / torrent", "Paste a magnet link, a .torrent URL, or press Browse for a .torrent file.")),
+            ("start_entry", ("Start episode", "The first episode to download (1 = from the beginning).")),
+            ("total_entry", ("Total episodes", "Stop after this episode number. Leave empty to download until the last episode.")),
+            ("lib_search", ("Search", "Type part of a title to filter your library.")),
+            ("q_url_entry", ("Queue link", "Link (or file) to add to the queue — choose the site on the left first.")),
+        ]
+        for attr, h in fields:
+            w = getattr(self, attr, None)
+            if w is not None:
+                try: w._help = h
+                except Exception: pass
 
     def _watch_os_theme(self):
         if self.settings.get("theme") == "auto":
@@ -6637,6 +6924,8 @@ class DownloaderApp:
             messagebox.showerror("Error", "Please enter a valid URL")
             return
 
+        if self.redirect_wrong_tab(raw_url, source):
+            return
         url = self.sanitize_url(raw_url)
         if not self.confirm_not_duplicate(url):
             return
@@ -6667,6 +6956,30 @@ class DownloaderApp:
     NARTO_CLAUDE_TOKEN_MAX_AGE = 120  # seconds before the playlist (and its stream tokens) is re-fetched
     NARTO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
+    # v1.9.2: a link pasted into the wrong site tab is offered to the right tab instead of failing
+    LINK_SITES = [("shortmax", 1, 0, "Shortmax"), ("narto", 2, 1, "Narto (Original)"), ("tiktok.com", 4, 4, "TikTok"),
+                  ("dailymotion.com", 5, 3, "Dailymotion"), ("dai.ly", 5, 3, "Dailymotion")]
+    SOURCE_ENTRY = {1: "url_entry1", 2: "url_entry2", 7: "url_entry7", 5: "url_entry5", 4: "url_entry4", 3: "url_entry3"}
+
+    def redirect_wrong_tab(self, raw_url, source):
+        """Returns True when the link belongs to another tab (the download is then started there, or cancelled)."""
+        host = urllib.parse.urlparse(raw_url.strip()).netloc.lower()
+        for key, target, tab_index, name in self.LINK_SITES:
+            if key in host:
+                if target == source or (target == 2 and source == 7):
+                    return False
+                if not messagebox.askyesno("Wrong tab", f"This is a {name} link, but you pressed the button of another site.\n\n"
+                                                        f"Download it in the {name} tab instead?"):
+                    return True
+                entry = getattr(self, self.SOURCE_ENTRY[target])
+                entry.delete(0, tk.END)
+                entry.insert(0, raw_url.strip())
+                try: self.home_tabs.select(tab_index)
+                except Exception: pass
+                self.start_thread(target)
+                return True
+        return False
+
     def start_narto_claude_thread(self):
         self.stop_flag = False
 
@@ -6679,6 +6992,8 @@ class DownloaderApp:
             messagebox.showerror("Error", "Please enter a narto-drama.com watch URL")
             return
 
+        if self.redirect_wrong_tab(raw_url, 7):
+            return
         url = self.sanitize_url(raw_url)
         if not self.confirm_not_duplicate(url):
             return
@@ -7271,7 +7586,113 @@ class DownloaderApp:
             kwargs["creationflags"] = 0x08000000
 
         res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", **kwargs)
-        return res.stdout if res.returncode == 0 else ""
+        body = res.stdout if res.returncode == 0 else ""
+        # v1.9.2: narto-drama.com now shows a "Checking your browser..." page to programs. Use YOUR browser's
+        # session (the cookies your browser gets after it passes the check), then ask again once.
+        if self.is_browser_check_page(body) and not getattr(self, "_in_gate_retry", False):
+            self._in_gate_retry = True
+            try:
+                if self.prepare_site_cookies(target_url):
+                    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", **kwargs)
+                    body = res.stdout if res.returncode == 0 else ""
+                if self.is_browser_check_page(body):
+                    self.report_browser_check(target_url)
+            finally:
+                self._in_gate_retry = False
+        return body
+
+    # ------------------------------------------------------------------ v1.9.2: site browser checks
+    @staticmethod
+    def is_browser_check_page(body):
+        if not body or len(body) > 20000:
+            return False
+        low = body.lower()
+        return ("checking your browser" in low or "challenge-platform" in low or "just a moment" in low) and \
+               ("location.reload" in low or "cf-chl" in low or "challenge-platform" in low)
+
+    def _merge_netscape_cookies(self, src_text, domain_key):
+        """Adds the site's cookies from a cookies.txt export into the app's cookie jar (replacing older ones)."""
+        new = {}
+        for ln in src_text.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 7 and domain_key in parts[0].lower():
+                new[(parts[0].replace("#HttpOnly_", "").lower(), parts[5])] = ln.strip()
+        if not new:
+            return 0
+        kept = []
+        try:
+            for ln in open(self.cookie_jar_file, encoding="utf-8", errors="ignore"):
+                parts = ln.rstrip("\n").split("\t")
+                if len(parts) >= 7 and (parts[0].replace("#HttpOnly_", "").lower(), parts[5]) in new:
+                    continue
+                kept.append(ln.rstrip("\n"))
+        except OSError:
+            kept = ["# Netscape HTTP Cookie File"]
+        if not kept or not kept[0].startswith("# Netscape"):
+            kept.insert(0, "# Netscape HTTP Cookie File")
+        with open(self.cookie_jar_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept + list(new.values())) + "\n")
+        return len(new)
+
+    def prepare_site_cookies(self, url):
+        """Loads your browser's cookies for this site: from an exported file next to the app, or straight from
+        your browser through yt-dlp (Edge / Firefox / Chrome / Brave / Safari). Returns True if any were found."""
+        host = urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+        key = host[4:] if host.startswith("www.") else host
+        short = key.split(".")[0]
+        for name in (f"{short}_cookies_browser.txt", f"{key}_cookies.txt", f"{short}_browser_cookies.txt", "cookies.txt"):
+            p = os.path.join(self.base_dir, name)
+            if os.path.exists(p):
+                n = self._merge_netscape_cookies(open(p, encoding="utf-8", errors="ignore").read(), short)
+                if n:
+                    self.log_message(f"{key}: using {n} cookie(s) from {name}")
+                    return True
+        yt = self.get_yt_dlp_path()
+        if not yt or not os.path.exists(yt):
+            return False
+        browsers = ["edge", "firefox", "chrome", "brave", "opera"]
+        if sys.platform == "darwin":
+            browsers.insert(0, "safari")
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        tmp = os.path.join(self.base_dir, f".{short}_cookie_export.txt")
+        for b in browsers:
+            self.update_status(f"{key} shows a browser check — borrowing your {b.title()} session…", "orange")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                subprocess.run([yt, "--cookies-from-browser", b, "--cookies", tmp, "--skip-download", "--no-warnings",
+                                "--ignore-errors", "--no-playlist", f"https://{host}/"], capture_output=True, text=True,
+                               encoding="utf-8", errors="ignore", timeout=60, **kwargs)
+                if os.path.exists(tmp):
+                    n = self._merge_netscape_cookies(open(tmp, encoding="utf-8", errors="ignore").read(), short)
+                    if n:
+                        self.log_message(f"{key}: using {n} cookie(s) from your {b.title()} browser")
+                        return True
+            except Exception:
+                pass
+            finally:
+                try: os.remove(tmp)
+                except OSError: pass
+        return False
+
+    def report_browser_check(self, url):
+        host = urllib.parse.urlparse(url).netloc
+        if time.time() - getattr(self, "_gate_reported", 0) < 60:
+            return
+        self._gate_reported = time.time()
+        short = host.replace("www.", "").split(".")[0]
+        msg = (f"{host} is showing a 'Checking your browser…' page, so the app can't read the episode list.\n\n"
+               f"Fix (1 minute):\n"
+               f"1. Open {host} in Edge or Firefox and play any episode, so your browser passes the check.\n"
+               f"2. Close that browser completely, then press Start again — the app borrows your browser's session.\n\n"
+               f"If it still fails: with the free browser extension 'Get cookies.txt LOCALLY', export the cookies of {host} "
+               f"and save the file next to Downloader.py as:\n    {short}_cookies_browser.txt")
+        self.log_message(f"BROWSER CHECK on {host}: " + msg.replace("\n", " "))
+        self.update_status(f"{host}: browser check — see the message / log to fix it in 1 minute.", "red")
+        try:
+            self.root.after(0, lambda: (messagebox.showwarning("Browser check", msg), webbrowser.open(f"https://{host}/")))
+        except Exception:
+            pass
 
     def is_valid_stream_url(self, u):
         if not u or not isinstance(u, str) or not u.startswith("http"):
@@ -7752,10 +8173,12 @@ class DownloaderApp:
 
                             if source == 1 and self.shortmax_recover_from_error(err):
                                 continue
-                            if source == 1 and "cloudflare" in err.lower():
+                            if source == 1 and ("cloudflare" in err.lower() or self.is_http_403(err)):
                                 self.log_message(
-                                    "Shortmax: blocked by the site's Cloudflare bot check (HTTP 403). "
-                                    "Retrying will not help. Pass the check in your browser, quit the browser, then start again."
+                                    "Shortmax: blocked by the site's bot check (HTTP 403) — every cookie source was tried, retrying will not help.\n"
+                                    "Fix: 1) ⚙️ Settings → 'Update yt-dlp (+ impersonation)'. 2) Open the series in Chrome/Edge, play an episode, "
+                                    "then export the site's cookies with the 'Get cookies.txt LOCALLY' extension and save them next to Downloader.py "
+                                    "as shortmax_cookies.txt. 3) Start again."
                                 )
                                 break
 
@@ -7793,8 +8216,8 @@ class DownloaderApp:
                 if not success and not self.stop_flag:
                     if not downloaded_files:
                         self.log_message(f"FAILED ON EPISODE {episode}. Final Error:\n{err}")
-                        if source == 1 and "cloudflare" in err.lower():
-                            self.update_status("Shortmax blocked by Cloudflare bot check (403). See log.", "red")
+                        if source == 1 and ("cloudflare" in err.lower() or self.is_http_403(err)):
+                            self.update_status("Shortmax blocked by its bot check (403): add shortmax_cookies.txt — see log / ℹ️.", "red")
                         else:
                             self.update_status(f"Ep {episode} Failed. Check Log.", "red")
                         if not keep_buttons_locked:
