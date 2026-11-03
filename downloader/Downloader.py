@@ -1,8 +1,10 @@
 import os, sys, subprocess, re, threading, urllib.parse, webbrowser, datetime, time, shutil, copy
 import json, math
+import urllib.request
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
+import tkinter.simpledialog
 
 # Optional Drag-and-Drop support if user has tkinterdnd2 installed
 try:
@@ -268,10 +270,508 @@ def render_banner(master, w, h, left, mid, right):
     return _rows_to_photo(master, rows).zoom(2, 2)
 
 
+# =============================================================================
+# 🎬 NADER PLAYER (v1.9.1): fast external player (mpv engine) + control panel
+# Voice-sync fixing, Arabic subtitles, auto-sync subtitles to the voice, speed,
+# voice boost, resume where you stopped. Falls back to VLC or the system player.
+# =============================================================================
+import socket as _socket
+import hashlib as _hashlib
+
+
+def find_mpv(base_dir=""):
+    names = ["mpv.exe", "mpv.com"] if sys.platform == "win32" else ["mpv"]
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    cands = []
+    if sys.platform == "win32":
+        la = os.environ.get("LOCALAPPDATA", "")
+        pf = [os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+        cands += [os.path.join(base_dir, "mpv", "mpv.exe"), os.path.join(base_dir, "mpv.exe"),
+                  os.path.join(la, "Microsoft", "WinGet", "Links", "mpv.exe"),
+                  os.path.join(os.path.expanduser("~"), "scoop", "shims", "mpv.exe")]
+        cands += [os.path.join(p, "mpv", "mpv.exe") for p in pf]
+        winget_pk = os.path.join(la, "Microsoft", "WinGet", "Packages")
+        if os.path.isdir(winget_pk):
+            for d in os.listdir(winget_pk):
+                if "mpv" in d.lower():
+                    for root_dir, _, files in os.walk(os.path.join(winget_pk, d)):
+                        if "mpv.exe" in files:
+                            cands.append(os.path.join(root_dir, "mpv.exe"))
+    elif sys.platform == "darwin":
+        cands += ["/Applications/mpv.app/Contents/MacOS/mpv", "/opt/homebrew/bin/mpv", "/usr/local/bin/mpv",
+                  os.path.join(base_dir, "mpv.app", "Contents", "MacOS", "mpv")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ""
+
+
+def find_vlc():
+    p = shutil.which("vlc")
+    if p:
+        return p
+    for c in (r"C:\Program Files\VideoLAN\VLC\vlc.exe", r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+              "/Applications/VLC.app/Contents/MacOS/VLC"):
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+def parse_srt(text):
+    cues = []
+    blocks = re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip())
+    tre = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
+    for b in blocks:
+        lines = b.split("\n")
+        for i, ln in enumerate(lines):
+            m = tre.search(ln)
+            if m:
+                g = [int(x) for x in m.groups()]
+                st = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0
+                en = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0
+                body = "\n".join(lines[i + 1:]).strip()
+                if body:
+                    cues.append([st, en, body])
+                break
+    return cues
+
+
+def write_srt(cues, path):
+    def f(t):
+        t = max(0.0, t)
+        return f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{int(t % 60):02d},{int(round((t % 1) * 1000)) % 1000:03d}"
+    with open(path, "w", encoding="utf-8") as fh:
+        for i, (st, en, body) in enumerate(cues, 1):
+            fh.write(f"{i}\n{f(st)} --> {f(en)}\n{body}\n\n")
+
+
+def translate_lines(lines, target="ar", progress=None):
+    """Free web translation (Google gtx endpoint), in batches. Returns the translated lines (same count)."""
+    out = []
+    sep = "\n"
+    i = 0
+    while i < len(lines):
+        batch, size = [], 0
+        while i < len(lines) and size + len(lines[i]) < 3800 and len(batch) < 60:
+            batch.append(lines[i].replace("\n", " "))
+            size += len(lines[i]) + 1
+            i += 1
+        if not batch:
+            batch = [lines[i][:3800]]
+            i += 1
+        q = urllib.parse.quote(sep.join(batch))
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={q}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+        text = "".join(seg[0] for seg in data[0] if seg and seg[0])
+        parts = text.split("\n")
+        if len(parts) != len(batch):      # rare: the service merged lines — translate this batch one by one
+            parts = []
+            for line in batch:
+                u = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={urllib.parse.quote(line)}"
+                d = json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=30).read().decode("utf-8"))
+                parts.append("".join(seg[0] for seg in d[0] if seg and seg[0]))
+        out += [p.strip() for p in parts]
+        if progress:
+            progress(len(out), len(lines))
+    return out
+
+
+class MpvClient:
+    """Tiny JSON-IPC client for mpv (named pipe on Windows, unix socket elsewhere). Request/response only."""
+    def __init__(self, address):
+        self.address = address
+        self.lock = threading.Lock()
+        self.conn = None
+        self.req = 0
+        self._buf = b""
+
+    def connect(self, timeout=8.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if sys.platform == "win32":
+                    self.conn = open(self.address, "r+b", buffering=0)
+                else:
+                    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    s.connect(self.address)
+                    s.settimeout(3.0)
+                    self.conn = s
+                self._send_raw({"command": ["disable_event", "all"], "request_id": 0})
+                self._read_reply(0)
+                return True
+            except Exception:
+                self.conn = None
+                time.sleep(0.2)
+        return False
+
+    def _send_raw(self, obj):
+        data = (json.dumps(obj) + "\n").encode("utf-8")
+        if sys.platform == "win32":
+            self.conn.write(data)
+        else:
+            self.conn.sendall(data)
+
+    def _readline(self):
+        while b"\n" not in self._buf:
+            chunk = self.conn.read(4096) if sys.platform == "win32" else self.conn.recv(4096)
+            if not chunk:
+                raise ConnectionError("mpv closed")
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        return line
+
+    def _read_reply(self, rid):
+        for _ in range(50):
+            msg = json.loads(self._readline().decode("utf-8", "ignore") or "{}")
+            if msg.get("request_id") == rid:
+                return msg
+        return {}
+
+    def command(self, *args):
+        if self.conn is None:
+            return None
+        with self.lock:
+            try:
+                self.req += 1
+                rid = self.req
+                self._send_raw({"command": list(args), "request_id": rid})
+                msg = self._read_reply(rid)
+                return msg.get("data") if msg.get("error") == "success" else None
+            except Exception:
+                self.conn = None
+                return None
+
+    def get(self, prop):
+        return self.command("get_property", prop)
+
+    def set(self, prop, value):
+        return self.command("set_property", prop, value)
+
+    def close(self):
+        try:
+            if self.conn:
+                self.conn.close()
+        except Exception:
+            pass
+        self.conn = None
+
+
+class NaderPlayer:
+    """Opens a video in mpv and shows a control panel with the 'power' tools."""
+    def __init__(self, app, video_path):
+        self.app = app
+        self.path = os.path.abspath(video_path)
+        self.meta = app.lib_meta.setdefault(self.path, {})
+        self.proc = None
+        self.client = None
+        self.sub_path = ""
+        self.win = None
+        self.mpv = find_mpv(app.base_dir)
+        if not self.mpv:
+            if not app.offer_install_mpv():
+                return
+            self.mpv = find_mpv(app.base_dir)
+            if not self.mpv:
+                app.play_with_fallback(self.path)
+                return
+        self.start()
+
+    # --------------------------------------------------------------- engine
+    def start(self):
+        state_dir = os.path.join(self.app.base_dir, ".player_state")
+        os.makedirs(state_dir, exist_ok=True)
+        tag = _hashlib.md5(self.path.encode("utf-8")).hexdigest()[:10]
+        self.ipc = rf"\\.\pipe\nader_player_{tag}" if sys.platform == "win32" else os.path.join(state_dir, f"ipc_{tag}.sock")
+        if sys.platform != "win32" and os.path.exists(self.ipc):
+            try: os.remove(self.ipc)
+            except OSError: pass
+        cmd = [self.mpv, self.path, f"--input-ipc-server={self.ipc}", "--force-window=yes", "--keep-open=yes",
+               "--save-position-on-quit", f"--watch-later-directory={state_dir}", "--sub-auto=fuzzy", "--slang=ar,ara,en,eng",
+               "--hwdec=auto-safe", "--autofit-larger=90%x90%", f"--title=Nader Player — {os.path.basename(self.path)}",
+               "--sub-font-size=46", "--sub-border-size=3", "--osd-font-size=34",
+               f"--audio-delay={float(self.meta.get('audio_delay', 0.0)):.3f}"]
+        cmd += getattr(self.app, "_player_extra_args", [])
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        except Exception as e:
+            messagebox.showerror("Nader Player", f"Could not start the player:\n{e}")
+            return
+        self.client = MpvClient(self.ipc)
+        self.build_panel()
+        threading.Thread(target=self._connect, daemon=True).start()
+
+    def _connect(self):
+        ok = self.client.connect(10)
+        self.app.root.after(0, lambda: self._on_connected(ok))
+
+    def _on_connected(self, ok):
+        if not self.win or not self.win.winfo_exists():
+            return
+        if not ok:
+            self.status.config(text="Could not talk to the player window (it still plays).")
+            return
+        self.status.config(text="Ready. Tip: the panel stays next to the video — move it anywhere.")
+        sub = self._existing_sub()
+        if sub:
+            self.sub_path = sub
+        self._tick()
+
+    def _existing_sub(self):
+        base = os.path.splitext(self.path)[0]
+        for cand in (base + ".ar.srt", base + ".srt", base + ".en.srt"):
+            if os.path.exists(cand):
+                return cand
+        return ""
+
+    # ---------------------------------------------------------------- panel
+    def build_panel(self):
+        app = self.app
+        self.win = w = tk.Toplevel(app.root)
+        w.title("🎬 Nader Player — Controls")
+        w.configure(bg="#0f172a")
+        w.resizable(False, False)
+        try: w.attributes("-topmost", True)
+        except Exception: pass
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        BG, FG, MUTED = "#0f172a", "#f1f5f9", "#94a3b8"
+
+        def section(text):
+            tk.Label(w, text=text, bg=BG, fg="#38bdf8", font=("Arial", 10, "bold"), anchor="w").pack(fill="x", padx=12, pady=(8, 2))
+            f = tk.Frame(w, bg=BG)
+            f.pack(fill="x", padx=12)
+            return f
+
+        tk.Label(w, text=os.path.basename(self.path), bg=BG, fg=FG, font=("Arial", 11, "bold"), wraplength=520, justify="left").pack(fill="x", padx=12, pady=(10, 0))
+        self.time_lbl = tk.Label(w, text="--:-- / --:--", bg=BG, fg="#fbbf24", font=("Courier", 12, "bold"))
+        self.time_lbl.pack(anchor="w", padx=12)
+
+        r = section("▶ Playback")
+        for txt, fn in (("⏪ 10s", lambda: self.cmd("seek", -10)), ("⏯ Play / Pause", lambda: self.cmd("cycle", "pause")),
+                        ("10s ⏩", lambda: self.cmd("seek", 10)), ("⛶ Full Screen", lambda: self.cmd("cycle", "fullscreen")),
+                        ("📸 Snapshot", lambda: self.cmd("screenshot"))):
+            ttk.Button(r, text=txt, command=fn).pack(side="left", padx=2)
+        r2 = tk.Frame(w, bg=BG)
+        r2.pack(fill="x", padx=12, pady=(4, 0))
+        tk.Label(r2, text="Speed:", bg=BG, fg=FG).pack(side="left")
+        self.speed_var = tk.StringVar(value="1.0×")
+        cb = ttk.Combobox(r2, textvariable=self.speed_var, values=["0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "1.75×", "2.0×"], width=6, state="readonly")
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.client.set("speed", float(self.speed_var.get().rstrip("×"))))
+        self.boost_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r2, text="🔊 Voice boost (quiet dialogue louder)", variable=self.boost_var, command=self.toggle_boost).pack(side="left", padx=10)
+
+        r = section("🎙️ Voice sync — fix sound that is early or late")
+        for txt, d in (("-0.5s", -0.5), ("-0.1s", -0.1), ("-0.02s", -0.02)):
+            ttk.Button(r, text=txt, width=6, command=lambda d=d: self.shift_audio(d)).pack(side="left", padx=1)
+        self.audio_lbl = tk.Label(r, text="0 ms", bg=BG, fg="#fbbf24", font=("Arial", 10, "bold"), width=9)
+        self.audio_lbl.pack(side="left", padx=4)
+        for txt, d in (("+0.02s", 0.02), ("+0.1s", 0.1), ("+0.5s", 0.5)):
+            ttk.Button(r, text=txt, width=6, command=lambda d=d: self.shift_audio(d)).pack(side="left", padx=1)
+        ttk.Button(r, text="Reset", command=lambda: self.shift_audio(None)).pack(side="left", padx=6)
+        tk.Label(w, text="Voice comes BEFORE the lips → press +   •   voice comes AFTER the lips → press −   (saved for this video)",
+                 bg=BG, fg=MUTED, font=("Arial", 8)).pack(anchor="w", padx=12)
+
+        r = section("💬 Subtitles")
+        ttk.Button(r, text="🇸🇦 Arabic", style="Accent.TButton", command=self.arabic_subs).pack(side="left", padx=2)
+        ttk.Button(r, text="✨ Auto-sync to voice", command=self.auto_sync_subs).pack(side="left", padx=2)
+        ttk.Button(r, text="📂 Load .srt", command=self.load_srt_dialog).pack(side="left", padx=2)
+        ttk.Button(r, text="🔎 Find online", command=self.find_online).pack(side="left", padx=2)
+        r3 = tk.Frame(w, bg=BG)
+        r3.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Button(r3, text="On / Off", command=lambda: self.cmd("cycle", "sub-visibility")).pack(side="left", padx=2)
+        ttk.Button(r3, text="Next track", command=lambda: self.cmd("cycle", "sub")).pack(side="left", padx=2)
+        tk.Label(r3, text="  Timing:", bg=BG, fg=FG).pack(side="left")
+        ttk.Button(r3, text="−0.1s", width=6, command=lambda: self.shift_sub(-0.1)).pack(side="left", padx=1)
+        self.sub_lbl = tk.Label(r3, text="0 ms", bg=BG, fg="#fbbf24", font=("Arial", 10, "bold"), width=8)
+        self.sub_lbl.pack(side="left")
+        ttk.Button(r3, text="+0.1s", width=6, command=lambda: self.shift_sub(0.1)).pack(side="left", padx=1)
+        tk.Label(r3, text="  Size:", bg=BG, fg=FG).pack(side="left")
+        ttk.Button(r3, text="A−", width=3, command=lambda: self.cmd("add", "sub-scale", -0.1)).pack(side="left", padx=1)
+        ttk.Button(r3, text="A+", width=3, command=lambda: self.cmd("add", "sub-scale", 0.1)).pack(side="left", padx=1)
+
+        self.status = tk.Label(w, text="Starting the player…", bg=BG, fg=MUTED, font=("Arial", 9), wraplength=540, justify="left", anchor="w")
+        self.status.pack(fill="x", padx=12, pady=(10, 10))
+        self.audio_delay = float(self.meta.get("audio_delay", 0.0))
+        self.audio_lbl.config(text=f"{self.audio_delay * 1000:+.0f} ms")
+        if getattr(app, "_theme_now", "dark") == "light":
+            app._remap_tree(w, True)
+
+    # ------------------------------------------------------------- actions
+    def cmd(self, *args):
+        threading.Thread(target=lambda: self.client.command(*args), daemon=True).start()
+
+    def say(self, text):
+        self.app.root.after(0, lambda: self.win and self.win.winfo_exists() and self.status.config(text=text))
+
+    def _tick(self):
+        if not self.win or not self.win.winfo_exists():
+            return
+        if self.proc and self.proc.poll() is not None:
+            self.close()
+            return
+
+        def work():
+            pos, dur = self.client.get("time-pos"), self.client.get("duration")
+            if pos is not None:
+                self.meta["position"] = pos
+                self.meta["duration"] = dur
+
+                def show():
+                    if self.win and self.win.winfo_exists():
+                        self.time_lbl.config(text=f"{self._fmt(pos)} / {self._fmt(dur or 0)}")
+                self.app.root.after(0, show)
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(1000, self._tick)
+
+    @staticmethod
+    def _fmt(t):
+        t = int(t or 0)
+        return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60:02d}:{t % 60:02d}"
+
+    def shift_audio(self, d):
+        self.audio_delay = 0.0 if d is None else round(self.audio_delay + d, 3)
+        self.client.set("audio-delay", self.audio_delay)
+        self.audio_lbl.config(text=f"{self.audio_delay * 1000:+.0f} ms")
+        self.meta["audio_delay"] = self.audio_delay
+        self.app.save_lib_meta()
+        self.cmd("show-text", f"Voice sync {self.audio_delay * 1000:+.0f} ms", 1500)
+
+    def shift_sub(self, d):
+        cur = self.client.get("sub-delay") or 0.0
+        new = round(cur + d, 3)
+        self.client.set("sub-delay", new)
+        self.sub_lbl.config(text=f"{new * 1000:+.0f} ms")
+
+    def toggle_boost(self):
+        if self.boost_var.get():
+            self.client.command("af", "add", "@boost:lavfi=[dynaudnorm=f=150:g=15:p=0.9]")
+        else:
+            self.client.command("af", "remove", "@boost")
+
+    def load_sub(self, path, title=""):
+        self.sub_path = path
+        self.client.command("sub-add", path, "select", title or os.path.basename(path))
+        self.say(f"Subtitles loaded: {os.path.basename(path)}")
+
+    def load_srt_dialog(self):
+        p = filedialog.askopenfilename(title="Choose subtitles", filetypes=[("Subtitles", "*.srt *.vtt *.ass *.ssa"), ("All", "*.*")],
+                                       initialdir=os.path.dirname(self.path))
+        if p:
+            self.load_sub(p)
+
+    def _source_cues(self):
+        """Subtitle lines to work from: the .srt next to the video, else the video's own subtitle track."""
+        sub = self.sub_path or self._existing_sub()
+        if sub and os.path.exists(sub):
+            return parse_srt(open(sub, encoding="utf-8", errors="ignore").read()), sub
+        tmp = os.path.splitext(self.path)[0] + ".embedded.srt"
+        r = self.app.run_ffmpeg(["ffmpeg", "-y", "-i", self.path, "-map", "0:s:0", tmp])
+        if r.returncode == 0 and os.path.exists(tmp):
+            cues = parse_srt(open(tmp, encoding="utf-8", errors="ignore").read())
+            try: os.remove(tmp)
+            except OSError: pass
+            return cues, ""
+        return [], ""
+
+    def arabic_subs(self):
+        out = os.path.splitext(self.path)[0] + ".ar.srt"
+        if os.path.exists(out):
+            self.load_sub(out, "العربية")
+            return
+
+        def work():
+            if self.app.settings.get("opensubtitles_key"):
+                self.say("Looking for Arabic subtitles online…")
+                if self.app.opensubtitles_download(self.app.library_title(self.path), "ar", out):
+                    self.app.root.after(0, lambda: self.load_sub(out, "العربية"))
+                    return
+            cues, _src = self._source_cues()
+            if not cues:
+                self.say("No subtitles to translate in this video. Load an English .srt (📂) or use '🔎 Find online', then press 🇸🇦 again.\n"
+                         "Tip: ANK Media Studio can make subtitles from the voice (AI Subtitles).")
+                return
+            self.say(f"Translating {len(cues)} lines to Arabic…")
+            try:
+                ar = translate_lines([c[2] for c in cues], "ar", progress=lambda a, b: self.say(f"Translating to Arabic… {a}/{b}"))
+            except Exception as e:
+                self.say(f"Translation failed (internet needed): {e}")
+                return
+            write_srt([[c[0], c[1], t or c[2]] for c, t in zip(cues, ar)], out)
+            self.app.root.after(0, lambda: self.load_sub(out, "العربية"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def auto_sync_subs(self):
+        """Lines the subtitles up with the voice around the current scene (±3 s)."""
+        def work():
+            cues, _ = self._source_cues()
+            if len(cues) < 5:
+                self.say("Load subtitles first, then press ✨ Auto-sync.")
+                return
+            pos = float(self.client.get("time-pos") or 0.0)
+            dur = float(self.client.get("duration") or 0.0)
+            start = max(0.0, min(pos - 90, max(0.0, dur - 240)))
+            self.say("Listening to the voice to line up the subtitles…")
+            lag = self.app.estimate_sub_lag(self.path, [(c[0], c[1]) for c in cues], start, 240)
+            if lag is None:
+                self.say("Not enough dialogue here to compare — try again during a talking scene.")
+                return
+            self.client.set("sub-delay", lag)
+            self.app.root.after(0, lambda: self.sub_lbl.config(text=f"{lag * 1000:+.0f} ms"))
+            self.client.command("show-text", f"Subtitles synced {lag * 1000:+.0f} ms", 2000)
+            self.say(f"Subtitles moved {lag * 1000:+.0f} ms to match the voice.")
+        threading.Thread(target=work, daemon=True).start()
+
+    def find_online(self):
+        if not self.app.settings.get("opensubtitles_key"):
+            key = tk.simpledialog.askstring(
+                "OpenSubtitles", "Searching subtitles online uses OpenSubtitles.com (free).\n\n"
+                "1. Make a free account at opensubtitles.com\n2. Open 'API consumers' and create a key\n3. Paste the API key here:",
+                parent=self.win)
+            if not key:
+                return
+            self.app.settings["opensubtitles_key"] = key.strip()
+            self.app.save_settings()
+        lang = tk.simpledialog.askstring("Find subtitles", "Language code (ar = Arabic, en = English):", initialvalue="ar", parent=self.win) or "ar"
+        title = tk.simpledialog.askstring("Find subtitles", "Search for (title):", initialvalue=self.app.library_title(self.path), parent=self.win)
+        if not title:
+            return
+        out = os.path.splitext(self.path)[0] + f".{lang}.srt"
+
+        def work():
+            self.say(f"Searching OpenSubtitles for '{title}' ({lang})…")
+            if self.app.opensubtitles_download(title, lang, out):
+                self.app.root.after(0, lambda: self.load_sub(out))
+            else:
+                self.say("Nothing found online for this title. For Arabic, use 🇸🇦 (translates the English subtitles).")
+        threading.Thread(target=work, daemon=True).start()
+
+    def close(self):
+        try:
+            self.app.save_lib_meta()
+        except Exception:
+            pass
+        if self.client:
+            self.client.command("quit-watch-later") if self.proc and self.proc.poll() is None else None
+            self.client.close()
+        if self.win and self.win.winfo_exists():
+            self.win.destroy()
+        self.win = None
+        try:
+            self.app.root.after(300, self.app.refresh_library)
+        except Exception:
+            pass
+
+
+
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.version = "v1.9.0"
+        self.version = "v1.9.1"
         self.root.title(f"Nader Pro Video & Drama Studio {self.version} — Created by Nader Alkhansa")
         self.root.geometry("1200x950")
         self.root.minsize(960, 820)
@@ -3454,6 +3954,8 @@ class DownloaderApp:
             self.last_output_file = os.path.abspath(file_path)
             self.last_output_folder = os.path.dirname(self.last_output_file)
             name = os.path.basename(self.last_output_file)
+            if "_resume" not in self.last_output_file and not name.startswith(("temp", "_temp")) and ".uniform" not in name and ".synclock" not in name:
+                self.library_note_output(self.last_output_file)
             if not getattr(self, "_queue_running", False) and "_resume" not in self.last_output_file and not name.startswith(("temp", "_temp")) \
                     and ".uniform" not in name and ".synclock" not in name and time.time() - getattr(self, "_last_notify", 0) > 5:
                 self._last_notify = time.time()
@@ -4990,6 +5492,7 @@ class DownloaderApp:
             self.update_status(f"Queue: {dict(self.QUEUE_TYPES).get(job['type'])} — {job['url'][:70]}", "blue")
         self._on_main(prep)
         self.log_message(f"{'='*50}\n--- QUEUE JOB: {job['type']} ---\n{job['url']}")
+        self._current_dl_url = job["url"] if job["type"] not in ("tiktok_bulk", "torrent") else ""
         t = job["type"]
         try:
             if t == "narto_claude":
@@ -5013,85 +5516,520 @@ class DownloaderApp:
         return bool(after) and os.path.exists(after) and (after != before[0] or os.path.getmtime(after) > before[1])
 
     # ---- Library page ----
+    # =========================================================================
+    # 📚 LIBRARY (v1.9.1) — streaming-style poster wall, Nader Player, share, delete
+    # =========================================================================
+    POSTER_W, POSTER_H = 176, 250
+
+    def load_lib_meta(self):
+        self.lib_meta_path = os.path.join(self.base_dir, "library_meta.json")
+        try:
+            with open(self.lib_meta_path, "r", encoding="utf-8") as f:
+                self.lib_meta = json.load(f)
+        except Exception:
+            self.lib_meta = {}
+        self.poster_dir = os.path.join(self.base_dir, ".library_posters")
+        os.makedirs(self.poster_dir, exist_ok=True)
+
+    def save_lib_meta(self):
+        try:
+            with open(self.lib_meta_path, "w", encoding="utf-8") as f:
+                json.dump(self.lib_meta, f, indent=1, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def library_note_output(self, path):
+        """Remembers where a finished video came from and fetches its poster in the background."""
+        if not hasattr(self, "lib_meta"):
+            return
+        path = os.path.abspath(path)
+        m = self.lib_meta.setdefault(path, {})
+        url = getattr(self, "_current_dl_url", "")
+        if url and not m.get("url"):
+            m["url"] = url
+        m.setdefault("added", time.time())
+        self.save_lib_meta()
+        threading.Thread(target=self.ensure_poster, args=(path, True), daemon=True).start()
+
+    def library_title(self, path):
+        name = os.path.splitext(os.path.basename(path))[0]
+        name = re.sub(r"_(Full|EP\d+(-EP\d+)?)(_Claude)?$", "", name)
+        name = re.sub(r"^(Narto_Series_|Shortmax_|TikTok_)", "", name, flags=re.IGNORECASE)
+        return re.sub(r"[_\-]+", " ", name).strip() or os.path.basename(path)
+
+    def _poster_path(self, video):
+        import hashlib
+        return os.path.join(self.poster_dir, hashlib.md5(os.path.abspath(video).encode("utf-8")).hexdigest()[:16] + ".png")
+
+    def _image_url_from_page(self, url):
+        """Poster from the link we downloaded: yt-dlp thumbnail for video sites, else the page's share image."""
+        host = urllib.parse.urlparse(url).netloc.lower()
+        yt = self.get_yt_dlp_path()
+        if yt and os.path.exists(yt) and any(h in host for h in ("tiktok", "dailymotion", "youtube", "youtu.be", "vimeo", "facebook", "instagram")):
+            try:
+                kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+                r = subprocess.run([yt, "--get-thumbnail", "--no-playlist", "--no-warnings", url], capture_output=True, text=True,
+                                   timeout=40, encoding="utf-8", errors="ignore", **kwargs)
+                for ln in r.stdout.splitlines():
+                    if ln.startswith("http"):
+                        return ln.strip()
+            except Exception:
+                pass
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self.NARTO_UA, "Accept-Language": "en"})
+            html = urllib.request.urlopen(req, timeout=15).read(600000).decode("utf-8", "ignore")
+        except Exception:
+            return ""
+        for pat in (r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+                    r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
+                    r'"(?:poster|cover|cover_url|vertical_cover|thumb|thumbnail)"\s*:\s*"([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"',
+                    r'poster=["\']([^"\']+)'):
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                u = m.group(1).replace("\\/", "/").replace("&amp;", "&")
+                return urllib.parse.urljoin(url, u)
+        return ""
+
+    def ensure_poster(self, video, refresh_after=False, force=False):
+        out = self._poster_path(video)
+        if os.path.exists(out) and not force:
+            return out
+        vf = (f"scale={self.POSTER_W}:{self.POSTER_H}:force_original_aspect_ratio=increase,"
+              f"crop={self.POSTER_W}:{self.POSTER_H}")
+        made = False
+        url = self.lib_meta.get(os.path.abspath(video), {}).get("url", "")
+        if url:
+            img_url = self._image_url_from_page(url)
+            if img_url:
+                try:
+                    tmp = out + ".dl"
+                    req = urllib.request.Request(img_url, headers={"User-Agent": self.NARTO_UA, "Referer": url})
+                    with open(tmp, "wb") as f:
+                        f.write(urllib.request.urlopen(req, timeout=20).read(8 * 1024 * 1024))
+                    r = self.run_ffmpeg(["ffmpeg", "-y", "-i", tmp, "-vf", vf, "-frames:v", "1", out])
+                    made = r.returncode == 0 and os.path.exists(out)
+                    os.remove(tmp)
+                except Exception:
+                    made = False
+        if not made:   # a frame from the video itself
+            dur = self.get_media_duration(video)
+            t = max(1.0, min(dur * 0.12, 90.0)) if dur else 1.0
+            r = self.run_ffmpeg(["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", video, "-vf", vf, "-frames:v", "1", out])
+            made = r.returncode == 0 and os.path.exists(out)
+        if made and refresh_after:
+            try:
+                self.root.after(0, lambda: self._update_card_poster(video))
+            except Exception:
+                pass
+        return out if made else ""
+
+    # ------------------------------------------------------------------ page
     def build_library_page(self):
         page = ttk.Frame(self.page_container)
         self.pages["library"] = page
-        self._page_header(page, "📚 Library", "Everything you have downloaded, grouped by series. Double-click to play.")
-        top = ttk.Frame(page)
-        top.pack(fill="x", padx=14, pady=4)
-        ttk.Label(top, text="🔎 Search:").pack(side="left")
-        self.lib_search = ttk.Entry(top, width=40)
-        self.lib_search.pack(side="left", padx=6)
-        self.lib_search.bind("<KeyRelease>", lambda e: self.refresh_library())
-        ttk.Button(top, text="🔄 Refresh", command=self.refresh_library).pack(side="left", padx=4)
+        self.load_lib_meta()
+        top = tk.Frame(page, bg="#0b0f19")
+        top.pack(fill="x", padx=14, pady=(10, 4))
+        tk.Label(top, text="📚 My Library", font=("Arial", 16, "bold"), bg="#0b0f19", fg="#f8fafc").pack(side="left")
         self.lib_summary = tk.Label(top, text="", font=("Arial", 9, "bold"), bg="#0b0f19", fg="#94a3b8")
-        self.lib_summary.pack(side="right")
-        box = ttk.LabelFrame(page, text="Series", padding=(10, 6))
-        box.pack(fill="both", expand=True, padx=14, pady=(4, 10))
-        cols = ("files", "size", "date")
-        self.lib_tree = ttk.Treeview(box, columns=cols, show="tree headings", height=16)
-        self.lib_tree.heading("#0", text="Series / file")
-        self.lib_tree.column("#0", width=520)
-        for c, w_, title in (("files", 90, "Videos"), ("size", 110, "Size"), ("date", 160, "Last download")):
-            self.lib_tree.heading(c, text=title)
-            self.lib_tree.column(c, width=w_, anchor="w")
-        self.lib_tree.pack(fill="both", expand=True)
-        self.lib_tree.bind("<Double-1>", lambda e: self._lib_open(play=True))
-        btns = ttk.Frame(box, style="Card.TFrame")
-        btns.pack(fill="x", pady=(6, 0))
-        ttk.Button(btns, text="▶️ Play", style="Accent.TButton", command=lambda: self._lib_open(play=True)).pack(side="left", padx=2)
-        ttk.Button(btns, text="📂 Open Folder", command=lambda: self._lib_open(play=False)).pack(side="left", padx=2)
-        ttk.Button(btns, text="🗑️ Delete", style="Danger.TButton", command=self._lib_delete).pack(side="left", padx=2)
-        self._lib_paths = {}
+        self.lib_summary.pack(side="left", padx=12)
+        ttk.Button(top, text="🎬 Play Any Video…", command=self._lib_play_other).pack(side="right", padx=2)
+        ttk.Button(top, text="🔄", width=3, command=self.refresh_library).pack(side="right", padx=2)
+        self.lib_sort = tk.StringVar(value="Newest")
+        sc = ttk.Combobox(top, textvariable=self.lib_sort, values=["Newest", "Name", "Biggest", "Continue watching"], state="readonly", width=16)
+        sc.pack(side="right", padx=6)
+        sc.bind("<<ComboboxSelected>>", lambda e: self.refresh_library())
+        self.lib_search = ttk.Entry(top, width=26)
+        self.lib_search.pack(side="right", padx=4)
+        self.lib_search.bind("<KeyRelease>", lambda e: self._lib_search_later())
+        tk.Label(top, text="🔎", bg="#0b0f19", fg="#94a3b8").pack(side="right")
+
+        wrap = tk.Frame(page, bg="#0b0f19")
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.lib_canvas = tk.Canvas(wrap, bg="#0b0f19", highlightthickness=0)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.lib_canvas.yview)
+        self.lib_canvas.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        self.lib_canvas.pack(side="left", fill="both", expand=True)
+        self.lib_grid = tk.Frame(self.lib_canvas, bg="#0b0f19")
+        self._lib_win = self.lib_canvas.create_window(0, 0, window=self.lib_grid, anchor="nw")
+        self.lib_grid.bind("<Configure>", lambda e: self.lib_canvas.configure(scrollregion=self.lib_canvas.bbox("all")))
+        self.lib_canvas.bind("<Configure>", self._lib_on_resize)
+        for wdg in (self.lib_canvas, self.lib_grid):
+            wdg.bind("<MouseWheel>", lambda e: self.lib_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"))
+            wdg.bind("<Button-4>", lambda e: self.lib_canvas.yview_scroll(-3, "units"))
+            wdg.bind("<Button-5>", lambda e: self.lib_canvas.yview_scroll(3, "units"))
+        self._lib_cols = 0
+        self._lib_cards = {}
+        self._lib_items = []
+        self._lib_imgs = {}
+
+    def _lib_search_later(self):
+        if getattr(self, "_lib_search_job", None):
+            self.root.after_cancel(self._lib_search_job)
+        self._lib_search_job = self.root.after(250, self.refresh_library)
+
+    def _lib_on_resize(self, event):
+        self.lib_canvas.itemconfigure(self._lib_win, width=event.width)
+        cols = max(1, event.width // (self.POSTER_W + 26))
+        if cols != self._lib_cols:
+            self._lib_cols = cols
+            self._lib_layout()
+
+    def _lib_files(self):
+        items = []
+        for e in self.scan_library():
+            for f in e["files"]:
+                try:
+                    st = os.stat(f)
+                except OSError:
+                    continue
+                m = self.lib_meta.get(os.path.abspath(f), {})
+                items.append({"path": os.path.abspath(f), "title": self.library_title(f), "size": st.st_size,
+                              "mtime": m.get("added", st.st_mtime), "pos": m.get("position", 0), "dur": m.get("duration", 0)})
+        return items
 
     def refresh_library(self):
-        if not hasattr(self, "lib_tree"):
+        if not hasattr(self, "lib_grid"):
             return
         q = self.lib_search.get().strip().lower()
-        self.lib_tree.delete(*self.lib_tree.get_children())
-        self._lib_paths = {}
-        total_size = n_series = 0
-        for e in self.scan_library():
-            if q and q not in e["name"].lower() and not any(q in os.path.basename(f).lower() for f in e["files"]):
-                continue
-            n_series += 1
-            total_size += e["size"]
-            when = datetime.datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
-            sid = self.lib_tree.insert("", "end", text=f"🎬 {e['name']}", values=(len(e["files"]), f"{e['size'] / 1048576:.0f} MB", when), open=False)
-            self._lib_paths[sid] = ("series", os.path.dirname(e["files"][0]), e["files"])
-            for f in sorted(e["files"], key=lambda p: natural_sort_key(os.path.basename(p))):
-                fid = self.lib_tree.insert(sid, "end", text=os.path.basename(f),
-                                           values=("", f"{os.path.getsize(f) / 1048576:.1f} MB",
-                                                   datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M")))
-                self._lib_paths[fid] = ("file", f, [f])
-        self.lib_summary.config(text=f"{n_series} series  •  {total_size / 1073741824:.2f} GB")
-
-    def _lib_open(self, play=True):
-        sel = self.lib_tree.selection()
-        if not sel:
-            return
-        kind, path, files = self._lib_paths.get(sel[0], (None, None, []))
-        if not path:
-            return
-        if play:
-            self.open_last_file(files[0] if kind == "series" else path)
+        items = [i for i in self._lib_files() if not q or q in i["title"].lower() or q in os.path.basename(i["path"]).lower()]
+        order = self.lib_sort.get()
+        if order == "Name":
+            items.sort(key=lambda i: natural_sort_key(i["title"]))
+        elif order == "Biggest":
+            items.sort(key=lambda i: -i["size"])
+        elif order == "Continue watching":
+            items = [i for i in items if i["pos"] and (not i["dur"] or i["pos"] < i["dur"] - 30)]
+            items.sort(key=lambda i: -i["mtime"])
         else:
-            self.open_last_local_folder(os.path.dirname(path) if kind == "file" else path)
+            items.sort(key=lambda i: -i["mtime"])
+        self._lib_items = items
+        total = sum(i["size"] for i in items)
+        self.lib_summary.config(text=f"{len(items)} video{'s' if len(items) != 1 else ''}  •  {total / 1073741824:.2f} GB")
+        for c in self._lib_cards.values():
+            c.destroy()
+        self._lib_cards = {}
+        for it in items:
+            self._lib_cards[it["path"]] = self._lib_make_card(it)
+        self._lib_layout()
+        if not items:
+            card = tk.Label(self.lib_grid, text="Nothing here yet.\nFinished downloads appear here with their poster.",
+                            bg="#0b0f19", fg="#94a3b8", font=("Arial", 12), pady=60)
+            self._lib_cards["_empty"] = card
+            card.grid(row=0, column=0, padx=20, sticky="w")
+        if getattr(self, "_theme_now", "dark") == "light":
+            self._remap_tree(self.lib_grid, True)
+        missing = [it["path"] for it in items if not os.path.exists(self._poster_path(it["path"]))]
+        if missing:
+            threading.Thread(target=lambda: [self.ensure_poster(p, True) for p in missing], daemon=True).start()
 
-    def _lib_delete(self):
-        sel = self.lib_tree.selection()
-        if not sel:
+    def _lib_layout(self):
+        cols = max(1, self._lib_cols or 5)
+        for k, it in enumerate(self._lib_items):
+            card = self._lib_cards.get(it["path"])
+            if card:
+                card.grid(row=k // cols, column=k % cols, padx=8, pady=8, sticky="n")
+
+    def _poster_image(self, path):
+        pp = self._poster_path(path)
+        if os.path.exists(pp):
+            try:
+                return tk.PhotoImage(file=pp)
+            except Exception:
+                pass
+        if not hasattr(self, "_lib_placeholder"):
+            self._lib_placeholder = render_glossy(self.root, self.POSTER_W, self.POSTER_H, "#334155", "#111827", "#475569", "#131b2e", radius=10, shadow=0)
+        return self._lib_placeholder
+
+    def _lib_make_card(self, it):
+        path = it["path"]
+        card = tk.Frame(self.lib_grid, bg="#131b2e", highlightthickness=1, highlightbackground="#24324d")
+        img = self._poster_image(path)
+        self._lib_imgs[path] = img
+        poster = tk.Label(card, image=img, bg="#131b2e", cursor="hand2", bd=0)
+        poster.pack(padx=6, pady=(6, 2))
+        poster.bind("<Button-1>", lambda e: self.play_video(path))
+        card._poster = poster
+        if it["pos"] and it["dur"] and it["pos"] < it["dur"] - 30:
+            bar = tk.Frame(card, bg="#334155", height=4, width=self.POSTER_W)
+            bar.pack(padx=6)
+            bar.pack_propagate(False)
+            tk.Frame(bar, bg="#f43f5e", height=4, width=max(4, int(self.POSTER_W * it["pos"] / it["dur"]))).pack(side="left")
+        tk.Label(card, text=it["title"], bg="#131b2e", fg="#f8fafc", font=("Arial", 10, "bold"), wraplength=self.POSTER_W,
+                 justify="left", anchor="w").pack(fill="x", padx=8)
+        eps = re.search(r"(EP\d+(?:-EP\d+)?|Full)", os.path.basename(path))
+        info = f"{eps.group(1) + '  •  ' if eps else ''}{it['size'] / 1048576:.0f} MB  •  {datetime.datetime.fromtimestamp(it['mtime']).strftime('%d %b %Y')}"
+        tk.Label(card, text=info, bg="#131b2e", fg="#94a3b8", font=("Arial", 8)).pack(anchor="w", padx=8)
+        row = tk.Frame(card, bg="#131b2e")
+        row.pack(fill="x", padx=6, pady=(4, 8))
+        resume = it["pos"] and it["dur"] and it["pos"] < it["dur"] - 30
+        ttk.Button(row, text="▶ Resume" if resume else "▶ Play", style="Accent.TButton", command=lambda: self.play_video(path)).pack(side="left")
+        share = ttk.Button(row, text="📤 Share", width=8)
+        share.configure(command=lambda b=share: self._lib_share_menu(path, b))
+        share.pack(side="left", padx=3)
+        ttk.Button(row, text="🗑", width=3, style="Danger.TButton", command=lambda: self._lib_delete_file(path)).pack(side="left")
+        menu = tk.Menu(card, tearoff=0)
+        menu.add_command(label="▶ Play in Nader Player", command=lambda: self.play_video(path))
+        menu.add_command(label="🎛️ Open in Full Manual Edit", command=lambda: (self.fme_v_path_var.set(path), self.show_page("manual_edit")))
+        menu.add_command(label="📂 Show in folder", command=lambda: self.open_last_local_folder(os.path.dirname(path)))
+        menu.add_command(label="🖼️ Change poster…", command=lambda: self._lib_change_poster(path))
+        menu.add_command(label="🔄 Get poster again", command=lambda: threading.Thread(target=self.ensure_poster, args=(path, True, True), daemon=True).start())
+        for w_ in (card, poster):
+            w_.bind("<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
+            w_.bind("<Button-2>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
+        for w_ in [card] + list(card.winfo_children()):
+            w_.bind("<MouseWheel>", lambda e: self.lib_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"), add="+")
+            w_.bind("<Button-4>", lambda e: self.lib_canvas.yview_scroll(-3, "units"), add="+")
+            w_.bind("<Button-5>", lambda e: self.lib_canvas.yview_scroll(3, "units"), add="+")
+        return card
+
+    def _update_card_poster(self, path):
+        card = getattr(self, "_lib_cards", {}).get(path)
+        if card is None or not card.winfo_exists():
             return
-        kind, path, files = self._lib_paths.get(sel[0], (None, None, []))
-        if not files or not messagebox.askyesno("Delete", f"Delete {len(files)} file(s) from disk?\n\n" + "\n".join(os.path.basename(f) for f in files[:8])):
+        img = self._poster_image(path)
+        self._lib_imgs[path] = img
+        card._poster.config(image=img)
+
+    def _lib_change_poster(self, path):
+        src = filedialog.askopenfilename(title="Choose a poster image", filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.gif"), ("All", "*.*")])
+        if not src:
             return
-        for f in files:
-            for extra in (f, os.path.splitext(f)[0] + ".srt"):
-                try:
-                    os.remove(extra)
-                except OSError:
-                    pass
+        vf = f"scale={self.POSTER_W}:{self.POSTER_H}:force_original_aspect_ratio=increase,crop={self.POSTER_W}:{self.POSTER_H}"
+        self.run_ffmpeg(["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", "1", self._poster_path(path)])
+        self._update_card_poster(path)
+
+    def _lib_play_other(self):
+        f = filedialog.askopenfilename(title="Play a video", filetypes=[("Videos", "*.mp4 *.mkv *.webm *.mov *.avi *.ts *.m4v"), ("All", "*.*")])
+        if f:
+            self.play_video(f)
+
+    # --------------------------------------------------------------- player
+    def play_video(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror("Play", "This file is no longer on the disk.")
+            self.refresh_library()
+            return
+        NaderPlayer(self, path)
+
+    def offer_install_mpv(self):
+        """Nader Player runs on the free mpv engine. Returns True if an install was started and finished."""
+        if not messagebox.askyesno("Nader Player", "Nader Player uses the free, very fast 'mpv' video engine, which is not on this computer yet.\n\n"
+                                                   "Install it now?\n\n(No = play with VLC or your normal player instead)"):
+            return False
+        if sys.platform == "win32" and shutil.which("winget"):
+            self.update_status("Installing the mpv engine with winget… (a window may ask for permission)", "orange")
+            r = subprocess.run(["winget", "install", "-e", "--id", "shinchiro.mpv", "--accept-source-agreements", "--accept-package-agreements"],
+                               capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if find_mpv(self.base_dir):
+                self.update_status("mpv installed. Enjoy Nader Player!", "green")
+                return True
+            self.log_message(f"winget mpv install output:\n{(r.stdout or '')[-1500:]}\n{(r.stderr or '')[-800:]}")
+        elif sys.platform == "darwin" and shutil.which("brew"):
+            self.update_status("Installing mpv with Homebrew…", "orange")
+            subprocess.run(["brew", "install", "mpv"], capture_output=True)
+            if find_mpv(self.base_dir):
+                return True
+        webbrowser.open("https://mpv.io/installation/")
+        messagebox.showinfo("Nader Player", "Your browser opened the mpv download page.\n\n"
+                                            "Windows: download the 'mpv' build, unzip it and put the 'mpv' folder next to Downloader.py "
+                                            "(…\\mpv\\mpv.exe). Mac: install mpv.app into Applications.\n\nThis video will now open in your normal player.")
+        return False
+
+    def play_with_fallback(self, path):
+        vlc = find_vlc()
+        if vlc:
+            args = [vlc, path]
+            srt = os.path.splitext(path)[0] + ".ar.srt"
+            if not os.path.exists(srt):
+                srt = os.path.splitext(path)[0] + ".srt"
+            if os.path.exists(srt):
+                args += [f"--sub-file={srt}"]
+            delay = float(self.lib_meta.get(os.path.abspath(path), {}).get("audio_delay", 0.0))
+            if delay:
+                args += [f"--audio-desync={int(delay * 1000)}"]
+            subprocess.Popen(args)
+        else:
+            self.open_last_file(path)
+
+    # ------------------------------------------------------------ subtitles
+    def opensubtitles_download(self, query, lang, out_path):
+        key = self.settings.get("opensubtitles_key")
+        if not key:
+            return False
+        headers = {"Api-Key": key, "User-Agent": f"NaderDownloader {self.version}", "Accept": "application/json",
+                   "Content-Type": "application/json"}
+        try:
+            q = urllib.parse.urlencode({"query": query, "languages": lang})
+            req = urllib.request.Request(f"https://api.opensubtitles.com/api/v1/subtitles?{q}", headers=headers)
+            data = json.loads(urllib.request.urlopen(req, timeout=25).read().decode("utf-8"))
+            for item in data.get("data", []):
+                files = item.get("attributes", {}).get("files", [])
+                if not files:
+                    continue
+                body = json.dumps({"file_id": files[0]["file_id"], "sub_format": "srt"}).encode("utf-8")
+                req = urllib.request.Request("https://api.opensubtitles.com/api/v1/download", data=body, headers=headers, method="POST")
+                link = json.loads(urllib.request.urlopen(req, timeout=25).read().decode("utf-8")).get("link")
+                if link:
+                    raw = urllib.request.urlopen(urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"}), timeout=30).read()
+                    with open(out_path, "wb") as f:
+                        f.write(raw)
+                    return True
+        except Exception as e:
+            self.log_message(f"OpenSubtitles: {e}")
+        return False
+
+    def estimate_sub_lag(self, video, cues, start, length, rate=50):
+        """Seconds the subtitles must be delayed so they line up with the voice (None if not enough dialogue)."""
+        import array
+        kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", video, "-map", "0:a:0",
+                            "-ac", "1", "-ar", "8000", "-af", "highpass=f=200,lowpass=f=3500", "-f", "s16le", "-"], capture_output=True, **kwargs)
+        pcm = array.array("h")
+        pcm.frombytes(r.stdout[: len(r.stdout) // 2 * 2])
+        step = 8000 // rate
+        env = [sum(map(abs, pcm[k:k + step:4])) / max(1, len(pcm[k:k + step:4])) for k in range(0, len(pcm) - step + 1, step)]
+        if len(env) < rate * 20:
+            return None
+        mask = [0] * len(env)
+        for st, en in cues:
+            for k in range(max(0, int((st - start) * rate)), min(len(env), int((en - start) * rate))):
+                mask[k] = 1
+        idx = [k for k, m in enumerate(mask) if m]
+        if len(idx) < rate:
+            return None
+        mean = sum(env) / len(env)
+        env = [x - mean for x in env]
+        n, best, best_score = len(env), 0, None
+        for lag in range(-3 * rate, 3 * rate + 1):
+            score = sum(env[k + lag] for k in idx if 0 <= k + lag < n)
+            if best_score is None or score > best_score:
+                best, best_score = lag, score
+        return best / rate
+
+    # ----------------------------------------------------------------- share
+    def _find_blip(self):
+        if sys.platform == "win32":
+            la = os.environ.get("LOCALAPPDATA", "")
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            for c in (os.path.join(la, "Programs", "Blip", "Blip.exe"), os.path.join(la, "Programs", "blip", "Blip.exe"),
+                      os.path.join(la, "Blip", "Blip.exe"), os.path.join(pf, "Blip", "Blip.exe")):
+                if os.path.isfile(c):
+                    return c
+            start_menu = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
+            for root_dir, _, files in os.walk(start_menu):
+                for fn in files:
+                    if fn.lower().startswith("blip") and fn.lower().endswith(".lnk"):
+                        return os.path.join(root_dir, fn)
+        elif sys.platform == "darwin":
+            for c in ("/Applications/Blip.app", os.path.expanduser("~/Applications/Blip.app")):
+                if os.path.isdir(c):
+                    return c
+        return shutil.which("blip") or ""
+
+    def _copy_file_to_clipboard(self, path):
+        try:
+            if sys.platform == "win32":
+                p = path.replace("'", "''")
+                subprocess.Popen(["powershell", "-NoProfile", "-Command", f"Set-Clipboard -LiteralPath '{p}'"], creationflags=0x08000000)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e", f'set the clipboard to (POSIX file "{path}")'])
+            else:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(path)
+            return True
+        except Exception:
+            return False
+
+    def _lib_share_menu(self, path, widget):
+        m = tk.Menu(self.root, tearoff=0)
+        if sys.platform == "darwin":
+            m.add_command(label="📡 AirDrop", command=lambda: self.share_airdrop(path))
+        m.add_command(label="🔵 Bluetooth", command=lambda: self.share_bluetooth(path))
+        m.add_command(label="⚡ Blip", command=lambda: self.share_blip(path))
+        m.add_separator()
+        m.add_command(label="📋 Copy file (paste anywhere)", command=lambda: self._copy_file_to_clipboard(path) and
+                      self.update_status("Video copied — paste it into a chat, folder or app.", "green"))
+        m.add_command(label="📂 Show in folder", command=lambda: self.open_last_local_folder(os.path.dirname(path)))
+        m.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+
+    def share_airdrop(self, path):
+        js = ("ObjC.import('AppKit'); var s=$.NSSharingService.sharingServiceNamed($.NSSharingServiceNameSendViaAirDrop);"
+              f"s.performWithItems($([$.NSURL.fileURLWithPath({json.dumps(path)})])); delay(300);")
+        try:
+            subprocess.Popen(["osascript", "-l", "JavaScript", "-e", js])
+            self.update_status("AirDrop opened — pick the iPhone/Mac to send to.", "green")
+        except Exception:
+            subprocess.Popen(["open", "-R", path])
+
+    def share_bluetooth(self, path):
+        try:
+            if sys.platform == "win32":
+                self._copy_file_to_clipboard(path)
+                subprocess.Popen(["fsquirt.exe"])
+                messagebox.showinfo("Bluetooth", "Windows Bluetooth transfer opened.\n\nChoose 'Send files' → your phone → 'Browse…'. "
+                                                 "The video's folder is opened for you too:\n" + path)
+                self.open_last_local_folder(os.path.dirname(path))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Bluetooth File Exchange", path])
+            elif shutil.which("bluetooth-sendto"):
+                subprocess.Popen(["bluetooth-sendto", path])
+            else:
+                messagebox.showinfo("Bluetooth", "No Bluetooth sender found on this computer.")
+        except Exception as e:
+            messagebox.showerror("Bluetooth", str(e))
+
+    def share_blip(self, path):
+        blip = self._find_blip()
+        if not blip:
+            if messagebox.askyesno("Blip", "Blip isn't installed on this computer.\n\nDownload it now (free, blip.net)?"):
+                webbrowser.open("https://blip.net")
+            return
+        try:
+            self._copy_file_to_clipboard(path)
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", blip, path])
+            elif blip.lower().endswith(".lnk"):
+                os.startfile(blip)
+                self.open_last_local_folder(os.path.dirname(path))
+            else:
+                subprocess.Popen([blip, path])
+                self.open_last_local_folder(os.path.dirname(path))
+            self.update_status("Blip opened — the video is copied: paste it (Ctrl+V) or drag it from the folder onto your phone in Blip.", "green")
+        except Exception as e:
+            messagebox.showerror("Blip", str(e))
+
+    # ---------------------------------------------------------------- delete
+    def _lib_delete_file(self, path):
+        name = os.path.basename(path)
+        size = os.path.getsize(path) / 1048576 if os.path.exists(path) else 0
+        if not messagebox.askyesno("Delete video", f"Are you sure you want to delete this video?\n\n{name}\n({size:.0f} MB)\n\n"
+                                                   "It will be removed from your computer.", icon="warning"):
+            return
+        base = os.path.splitext(path)[0]
+        for extra in [path, self._poster_path(path)] + [base + s for s in (".srt", ".ar.srt", ".en.srt")]:
+            try:
+                os.remove(extra)
+            except OSError:
+                pass
+        self.lib_meta.pop(os.path.abspath(path), None)
+        self.save_lib_meta()
+        try:
+            folder = os.path.dirname(path)
+            if not os.listdir(folder):
+                os.rmdir(folder)
+        except OSError:
+            pass
         self.refresh_library()
+        self.update_status(f"Deleted {name}", "orange")
+
+
+
+
+
+
 
     # ---- Settings & health page ----
     def build_settings_page(self):
@@ -5477,6 +6415,7 @@ class DownloaderApp:
         threading.Thread(target=run_merge, daemon=True).start()
 
     def start_bulk_txt(self):
+        self._current_dl_url = ""
         candidate_dirs = [
             self.base_dir,
             os.path.expanduser("~/Desktop/Dramadownload"),
@@ -5682,6 +6621,7 @@ class DownloaderApp:
         url = self.sanitize_url(raw_url)
         if not self.confirm_not_duplicate(url):
             return
+        self._current_dl_url = url
         self.save_to_history(source, url)
         self.disable_buttons_for_run()
 
@@ -5723,6 +6663,7 @@ class DownloaderApp:
         url = self.sanitize_url(raw_url)
         if not self.confirm_not_duplicate(url):
             return
+        self._current_dl_url = url
         self.save_to_history(7, url)
         try:
             workers = max(1, min(6, int(self.narto_claude_parallel_var.get())))
@@ -6069,7 +7010,6 @@ class DownloaderApp:
             return cached
         trackers = []
         try:
-            import urllib.request
             req = urllib.request.Request(
                 "https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt",
                 headers={"User-Agent": "Mozilla/5.0"}
